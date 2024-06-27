@@ -132,6 +132,17 @@ if [ "$src_bankfull_toggle" = "True" ]; then
     Tcount
 fi
 
+## RUN MANNING N OPTIMIZATION ROUTINE AND ADJUST SRCS  ##
+if [ "$src_optz_manningN_toggle" = "True" ]; then
+    echo -e $startDiv"Optimizing manningN for SRCs"
+    # Run manningN optimization routine
+    Tstart
+    python3 $srcDir/manningN_optimization.py \
+        -fim_dir $outputDestDir \
+        -mannN_aibased $mannN_file_aibased
+    Tcount
+fi
+
 ## RUN SYNTHETIC RATING SUBDIVISION ROUTINE ##
 if [ "$src_subdiv_toggle" = "True" ] && [ "$src_bankfull_toggle" = "True" ]; then
     echo -e $startDiv"Performing SRC channel/overbank subdivision routine"

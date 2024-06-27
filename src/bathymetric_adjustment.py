@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import re
 import sys
+import traceback
 from argparse import ArgumentParser
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from os.path import join
@@ -186,9 +187,12 @@ def correct_rating_for_ai_based_bathymetry(fim_dir, huc, strm_order, bathy_file_
         aib_bathy_data_df["order_"] < strm_order,
         ["missing_xs_area_m2", "missing_wet_perimeter_m", "Bathymetry_source"],
     ] = 0
-    aib_df = aib_bathy_data_df[
+    aib_df0 = aib_bathy_data_df[
         ['feature_id', 'missing_xs_area_m2', 'missing_wet_perimeter_m', 'Bathymetry_source']
     ]
+    # test = aib_df[aib_df.duplicated(subset='feature_id', keep=False)]
+    aib_df = aib_df0.drop_duplicates(subset=['feature_id'], keep='first')
+    aib_df.index = range(len(aib_df))
 
     # Get src_full from each branch
     src_all_branches_path = []
@@ -211,7 +215,7 @@ def correct_rating_for_ai_based_bathymetry(fim_dir, huc, strm_order, bathy_file_
         if "missing_xs_area_m2" not in src_df.columns:
             src_df.drop(columns=["Bathymetry_source"], inplace=True)
             src_df = src_df.merge(aib_df, on='feature_id', how='left', validate='many_to_one')
-            # print([src,src_df.columns])
+            # print([src,src_df.columns]) src_df.Bathymetry_source
         else:
             src_df = pd.read_csv(src, low_memory=False)
             src_df = src_df.merge(aib_df, on='feature_id', how='left', validate='many_to_one')
@@ -273,13 +277,15 @@ def correct_rating_for_ai_based_bathymetry(fim_dir, huc, strm_order, bathy_file_
     return log_text
 
 
-# -------------------------------------------------------
+# --------------------------------------------------------
 # Apply src_adjustment_for_bathymetry
 def apply_src_adjustment_for_bathymetry(
-    fim_dir, huc, strm_order, bathy_file_ehydro, bathy_file_aibased, verbose
+    fim_dir, huc, strm_order, bathy_file_ehydro, bathy_file_aibased, verbose, log_file_path
 ):
     """
     Function for applying both eHydro & AI-based bathymetry adjustment to synthetic rating curves.
+
+    Note: Any failure in here will be logged when it can be but will not abort the Multi-Proc
 
         Parameters
         ----------
@@ -290,25 +296,49 @@ def apply_src_adjustment_for_bathymetry(
         ----------
         log_text : str
     """
-    if os.path.exists(bathy_file_ehydro):
+    log_text = ""
+    try:
+        if os.path.exists(bathy_file_ehydro):
+            msg = f"Correcting rating curve for ehydro bathy for huc : {huc}"
+            log_text += msg + '\n'
+            print(msg)
+            log_text += correct_rating_for_ehydro_bathymetry(fim_dir, huc, bathy_file_ehydro, verbose)
+        else:
+            print(f'USACE eHydro bathymetry file does not exist for huc: {huc}')
 
-        correct_rating_for_ehydro_bathymetry(fim_dir, huc, bathy_file_ehydro, verbose)
+    except Exception:
+        log_text += f"An error has occurred while processing ehydro bathy for huc {huc}"
+        log_text += traceback.format_exc()
 
-    else:
-        print('USACE eHydro bathymetry file does not exist')
+    try:
+        with open(log_file_path, "a") as log_file:
+            log_file.write(log_text + '\n')
+    except Exception:
+        print(f"Error trying to write to the log file of {log_file_path}")
 
-    if os.path.exists(bathy_file_aibased):
+    log_text = ""
+    try:
+        if os.path.exists(bathy_file_aibased):
+            msg = f"Correcting rating curve for AI-based bathy for huc : {huc}"
+            log_text += msg + '\n'
+            print(msg + '\n')
 
-        correct_rating_for_ai_based_bathymetry(fim_dir, huc, strm_order, bathy_file_aibased, verbose)
+            log_text += correct_rating_for_ai_based_bathymetry(
+                fim_dir, huc, strm_order, bathy_file_aibased, verbose
+            )
+        else:
+            print(f'AI-based bathymetry file does not exist for huc : {huc}')
 
-    else:
-        print('AI-based bathymetry file does not exist')
+    except Exception:
+        log_text += f"An error has occurred while processing AI-based bathy for huc {huc}"
+        log_text += traceback.format_exc()
 
-    # return log_text
+    with open(log_file_path, "a") as log_file:
+        log_file.write(log_text + '\n')
 
 
 # -------------------------------------------------------
-def multi_process_hucs(
+def process_bathy_adjustment(
     fim_dir,
     strm_order,
     bathy_file_ehydro,
@@ -349,23 +379,25 @@ def multi_process_hucs(
 
     """
     # Set up log file
-    print(
-        'Writing progress to log file here: '
-        + str(join(fim_dir, 'logs', 'bathymetric_adjustment' + output_suffix + '.log'))
-    )
+    log_file_path = os.path.join(fim_dir, 'logs', 'bathymetric_adjustment' + output_suffix + '.log')
+    print(f'Writing progress to log file here: {log_file_path}')
     print('This may take a few minutes...')
     ## Create a time var to log run time
-    begin_time = dt.datetime.now()
+    begin_time = dt.datetime.now(dt.timezone.utc)
 
     ## Initiate log file
-    log_file = open(join(fim_dir, 'logs', 'bathymetric_adjustment' + output_suffix + '.log'), "w")
-    log_file.write('START TIME: ' + str(begin_time) + '\n')
-    log_file.write('#########################################################\n\n')
+    with open(log_file_path, "w") as log_file:
+        log_file.write('START TIME: ' + str(begin_time) + '\n')
+        log_file.write('#########################################################\n\n')
+
+    # Let log_text build up starting here until the bottom.
+    log_text = ""
 
     # Exit program if the bathymetric data doesn't exist
     if not all([os.path.exists(bathy_file_ehydro), os.path.exists(bathy_file_aibased)]):
         statement = f'The input bathymetry files {bathy_file_ehydro} and {bathy_file_aibased} do not exist. Exiting...'
-        log_file.write(statement)
+        with open(log_file_path, "w") as log_file:
+            log_file.write(statement)
         print(statement)
         sys.exit(0)
 
@@ -378,12 +410,15 @@ def multi_process_hucs(
     )  # HUCs that could also have bathymetric reaches included
     hucs_with_bathy = wbd.HUC8.to_list()
     hucs = [h for h in fim_hucs if h in hucs_with_bathy]
-    log_file.write(f"Identified {len(hucs)} HUCs that have USACE eHydro bathymetric data: {hucs}\n")
-    print(f"Identified {len(hucs)} HUCs that have USACE eHydro bathymetric data\n")
+    hucs.sort()
+    msg = f"Identified {len(hucs)} HUCs that have USACE eHydro bathymetric data: {hucs}\n"
+    log_text += msg
+    print(msg)
 
-    print(f"AI-Based bathymetry data is applied on streams with order {strm_order} or higher\n")
+    msg = f"AI-Based bathymetry data is applied on streams with order {strm_order} or higher\n"
+    log_text += msg
+    print(msg)
 
-    failed_HUCs_list = []
     with ProcessPoolExecutor(max_workers=number_of_jobs) as executor:
         # Loop through all hucs, build the arguments, and submit them to the process pool
         futures = {}
@@ -395,24 +430,21 @@ def multi_process_hucs(
                 'bathy_file_ehydro': bathy_file_ehydro,
                 'bathy_file_aibased': bathy_file_aibased,
                 'verbose': verbose,
+                'log_file_path': log_file_path,
             }
             future = executor.submit(apply_src_adjustment_for_bathymetry, **args)
             futures[future] = future
 
         for future in as_completed(futures):
             if future is not None:
-                if not future.exception():
-                    failed_huc = future.result()
-                    if failed_huc != "":
-                        failed_HUCs_list.append(failed_huc)
-                else:
+                if future.exception():
                     raise future.exception()
 
     ## Record run time and close log file
-    end_time = dt.datetime.now()
-    log_file.write('END TIME: ' + str(end_time) + '\n')
+    end_time = dt.datetime.now(dt.timezone.utc)
+    log_text += 'END TIME: ' + str(end_time) + '\n'
     tot_run_time = end_time - begin_time
-    log_file.write('TOTAL RUN TIME: ' + str(tot_run_time))
+    log_text += 'TOTAL RUN TIME: ' + str(tot_run_time).split('.')[0]
     log_file.close()
 
 
@@ -528,7 +560,7 @@ if __name__ == '__main__':
     number_of_jobs = args['number_of_jobs']
     verbose = bool(args['verbose'])
 
-    multi_process_hucs(
+    process_bathy_adjustment(
         fim_dir,
         strm_order,
         bathy_file_ehydro,
