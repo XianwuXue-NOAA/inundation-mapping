@@ -14,6 +14,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from geopandas.tools import sjoin
+import random
 
 from utils.shared_variables import DOWNSTREAM_THRESHOLD, ROUGHNESS_MAX_THRESH, ROUGHNESS_MIN_THRESH
 
@@ -27,8 +28,10 @@ ai_mannN_data = pd.read_parquet(mannN_file_aibased, engine='pyarrow')
 # aib_mannN_data.columns
 ai_mannN_data_df = ai_mannN_data[["COMID", "owp_roughness"]] #df_mann
 Stage_bankfull = "Stage_bankfull"
+optzN_on = True
+output_suffix = ""
 
-def manningN_optimization(fim_dir, huc, ai_mannN_data_df, Stage_bankfull): # branch_id, htable_filename, huc_output_dir
+def manningN_optimization(fim_dir, huc, ai_mannN_data_df, Stage_bankfull, optzN_on, output_suffix): # branch_id, htable_filename, huc_output_dir
 
     log_text = f'Optimizing manningN for HUC: {huc}\n'
 
@@ -47,6 +50,20 @@ def manningN_optimization(fim_dir, huc, ai_mannN_data_df, Stage_bankfull): # bra
     mannN_ai_df.index = range(len(mannN_ai_df))
     mannN_ai_df = mannN_ai_df.drop(columns=['ID', 'order_'])
     mannN_ai_df = mannN_ai_df.rename(columns={'COMID': 'feature_id'})
+
+    # Initializing optimized manningN
+    # MaxN = 0.5 # MinN = 0.01 #AI-N min=0.01 #max=0.35
+    mannN_ai_df['channel_ratio_optz'] = [random.uniform(0.025, 50) for _ in range(len(mannN_ai_df))] #[0.025,50]
+    mannN_ai_df['overbank_ratio_optz'] = [random.uniform(0.025, 50) for _ in range(len(mannN_ai_df))] #[0.025,50]
+    mannN_ai_df['channel_n_optz'] = mannN_ai_df['owp_roughness']*mannN_ai_df['channel_ratio_optz']
+    mannN_ai_df['overbank_n_optz'] = mannN_ai_df['owp_roughness']*mannN_ai_df['overbank_ratio_optz']
+    ch_lower_optz = 0.01
+    ch_upper_optz = 0.20
+    ob_lower_optz = 0.01
+    ob_upper_optz = 0.50
+    mannN_ai_df['channel_n_optz'] = mannN_ai_df['channel_n_optz'].clip(lower=ch_lower_optz, upper=ch_upper_optz)
+    mannN_ai_df['overbank_n_optz'] = mannN_ai_df['overbank_n_optz'].clip(lower=ob_lower_optz, upper=ob_upper_optz)
+
 
     # Get src_full from each branch
     src_all_branches_path = []
@@ -93,127 +110,91 @@ def manningN_optimization(fim_dir, huc, ai_mannN_data_df, Stage_bankfull): # bra
                 # drop these cols (in case optz_mann was previously performed)
                 if 'ManningN_optz' in src_df.columns:
                     src_df = src_df.drop(
-                        ['channel_n', 'overbank_n', 'ManningN_optz', 'vmann_on', 'Discharge (m3s-1)_optN'],
+                        ['channel_n_optz', 'overbank_n_optz', 'Discharge(cms)_optzN', 'optzN_on'],
                         axis=1,
                     )
-
+                
                 ## Merge (crosswalk) the df of Manning's n with the SRC df
                 src_df = src_df.merge(mannN_ai_df, how='left', on='feature_id')
-                src_df.columns
-                src_df['ManningN']
+                # src_df.columns
                 ## Calculate composite Manning's n using the channel geometry ratio attribute given by user
-                #   (e.g. chann_hradius_ratio or chann_vol_ratio)
-                src_df['optz_ManningN'] = (src_df[Stage_bankfull] * src_df['channel_n']) + (
-                    (1.0 - src_df[Stage_bankfull]) * src_df['overbank_n']
+                src_df['manningN_optz'] = (src_df[Stage_bankfull] * src_df['channel_n_optz']) + (
+                    (1.0 - src_df[Stage_bankfull]) * src_df['overbank_n_optz']
                 )
-                # print('Done calculating composite Manning n (' + Stage_bankfull + '): ' + str(huc))
-
-                ## Check if there are any missing data in the composite ManningN column
-                check_null_comp = src_df['optz_ManningN'].isnull().sum()
-                if check_null_comp > 0:
-                    log_text += (
-                        str(huc)
-                        + '  branch id: '
-                        + str(branch_id)
-                        + ' --> '
-                        + 'Missing values in the optz_ManningN calculation'
-                        + ' --> missing entries= '
-                        + str(check_null_comp / 84)
-                        + '\n'
-                    )
-                src_df['vmann_on'] = np.where(
-                    src_df['optz_ManningN'].isnull(), False, True
-                )  # create field to identify where vmann is applied (True=yes; False=no)
 
                 ## Define the channel geometry variable names to use from the src
                 hydr_radius = 'HydraulicRadius (m)'
                 wet_area = 'WetArea (m2)'
 
                 ## Calculate Q using Manning's equation
-                # Uncomment below to rename the previous Discharge column
-                # src_df = src_df.rename(columns={'Discharge (m3s-1)'})
-                src_df['Discharge (m3s-1)_varMann'] = (
+                src_df['Discharge(cms)_optzN'] = (
                     src_df[wet_area]
                     * pow(src_df[hydr_radius], 2.0 / 3)
                     * pow(src_df['SLOPE'], 0.5)
-                    / src_df['optz_ManningN']
+                    / src_df['manningN_optz']
                 )
 
-                ## Use the default discharge column when vmann is not being applied
-                src_df['Discharge (m3s-1)_varMann'] = np.where(
-                    src_df['vmann_on'] == False, src_df['Discharge (m3s-1)'], src_df['Discharge (m3s-1)_varMann']
-                )  # reset the discharge value back to the original if vmann=false
-                src_df['optz_ManningN'] = np.where(
-                    src_df['vmann_on'] == False, src_df['ManningN'], src_df['optz_ManningN']
-                )  # reset the ManningN value back to the original if vmann=false
+                src_df['optzN_on'] = optzN_on
+                ## Use the default discharge column when optzN is not being applied
+                src_df['Discharge(cms)_optzN'] = np.where(
+                    src_df['optzN_on'] == False, src_df['Discharge (m3s-1)'], src_df['Discharge(cms)_optzN']
+                )  # reset the discharge value back to the original if optzN_on=false
+                src_df['manningN_optz'] = np.where(
+                    src_df['optzN_on'] == False, src_df['ManningN'], src_df['manningN_optz']
+                )  # reset the ManningN value back to the original if optzN_on=false
 
                 ## Output new SRC with bankfull column
                 src_df.to_csv(src_path, index=False)
 
                 ## Output new hydroTable with updated discharge and ManningN column
                 src_df_trim = src_df[
-                    ['HydroID', 'Stage', 'vmann_on', 'optz_ManningN', 'Discharge (m3s-1)_varMann']
+                    ['HydroID', 'Stage', 'optzN_on', 'manningN_optz', 'Discharge(cms)_optzN']
                 ]
-                src_df_trim = src_df_trim.rename(
-                    columns={
-                        'Stage': 'stage',
-                        'optz_ManningN': 'vmann_ManningN',
-                        'Discharge (m3s-1)_varMann': 'vmann_discharge_cms',
-                    }
-                )
-                src_df_trim['ManningN'] = src_df_trim[
-                    'vmann_ManningN'
-                ]  # create a copy of vmann modified ManningN (used to track future changes)
-                src_df_trim['discharge_cms'] = src_df_trim[
-                    'vmann_discharge_cms'
-                ]  # create a copy of vmann modified discharge (used to track future changes)
-                df_htable = pd.read_csv(htable_filename, dtype={'HUC': str})
+                src_df_trim = src_df_trim.rename(columns={'Stage': 'stage'})
+                # create a copy of vmann modified ManningN (used to track future changes)
+                src_df_trim['ManningN'] = src_df_trim['manningN_optz']
+                # create a copy of vmann modified discharge (used to track future changes)
+                src_df_trim['discharge_cms'] = src_df_trim['Discharge(cms)_optzN']
 
-                ## Check if BARC ran
-                # if not set(['orig_discharge_cms']).issubset(df_htable.columns):
-                #     df_htable = df_htable.rename(columns={'discharge_cms':'orig_discharge_cms'})
-                #     df_htable = df_htable.rename(columns={'ManningN':'orig_ManningN'})
-                # else:
+                # Read hydro_table file
+                htable_name = f'hydroTable_{branch}.csv'
+                htable_filename = join(fim_huc_dir, 'branches', branch, htable_name)
+                df_htable = pd.read_csv(htable_filename, dtype={'HUC': str})
 
                 ## drop the previously modified discharge column to be replaced with updated version
                 df_htable = df_htable.drop(
-                    ['vmann_on', 'discharge_cms', 'ManningN', 'vmann_discharge_cms', 'vmann_ManningN'], axis=1
+                    ['optzN_on', 'discharge_cms', 'ManningN', 'Discharge(cms)_optzN', 'manningN_optz'], axis=1
                 )
                 df_htable = df_htable.merge(
                     src_df_trim, how='left', left_on=['HydroID', 'stage'], right_on=['HydroID', 'stage']
                 )
-
-                df_htable['vmann_on'] = np.where(
-                    df_htable['LakeID'] > 0, False, df_htable['vmann_on']
-                )  # reset the ManningN value back to the original if vmann=false
+                # reset the ManningN value back to the original if vmann=false
+                df_htable['optzN_on'] = np.where(
+                    df_htable['LakeID'] > 0, False, df_htable['optzN_on']
+                )
 
                 ## Output new hydroTable csv
                 if output_suffix != "":
                     htable_filename = os.path.splitext(htable_filename)[0] + output_suffix + '.csv'
                 df_htable.to_csv(htable_filename, index=False)
 
-                log_text += 'Completed: ' + str(huc)
-
-                ## plot rating curves
-                if src_plot_option:
-                    if isdir(huc_output_dir) is False:
-                        os.mkdir(huc_output_dir)
-                    generate_src_plot(src_df, huc_output_dir)
             except Exception as ex:
                 summary = traceback.StackSummary.extract(traceback.walk_stack(None))
-                print(str(huc) + '  branch id: ' + str(branch_id) + " failed for some reason")
-                print(f"*** {ex}")
-                print(''.join(summary.format()))
+                print(
+                    'WARNING: ' + str(huc) + '  branch id: ' + str(branch) + " manningN optimization failed for some reason"
+                )
                 log_text += (
                     'ERROR --> '
                     + str(huc)
                     + '  branch id: '
-                    + str(branch_id)
-                    + " failed (details: "
+                    + str(branch)
+                    + " manningN optimization failed (details: "
                     + (f"*** {ex}")
                     + (''.join(summary.format()))
                     + '\n'
                 )
+
+                log_text += 'Completed: ' + str(huc)
 
         return log_text
 
@@ -808,154 +789,89 @@ def update_rating_curve(
     return log_text
 
 
-def branch_network_tracer(df_input_htable):
-    df_input_htable = df_input_htable.astype(
-        {'NextDownID': 'int64'}
-    )  # ensure attribute has consistent format as int
-    # remove all hydroids associated with lake/water body
-    # (these often have disjoined artifacts in the network)
-    df_input_htable = df_input_htable.loc[df_input_htable['LakeID'] == -999]
-    # define start catchments as hydroids that are not found in the "NextDownID" attribute for all
-    # other hydroids
-    df_input_htable["start_catch"] = ~df_input_htable['HydroID'].isin(df_input_htable['NextDownID'])
+# def group_manningn_calc(df_nmerge, down_dist_thresh):
+#     ## Calculate group_calb_coef (mean calb n for consective hydroids) and apply values downsteam to
+#     # non-calb hydroids (constrained to first Xkm of hydroids - set downstream diststance var as input arg
+#     # df_nmerge = df_nmerge.sort_values(by=['NextDownID'])
+#     dist_accum = 0
+#     hyid_count = 0
+#     hyid_accum_count = 0
+#     run_accum_mann = 0
+#     group_calb_coef = 0
+#     branch_start = 1  # initialize counter and accumulation variables
+#     lid_count = 0
+#     prev_lid = 'x'
+#     for index, row in df_nmerge.iterrows():  # loop through the df (parse by hydroid)
+#         if int(df_nmerge.loc[index, 'branch_id']) != branch_start:  # check if start of new branch
+#             dist_accum = 0
+#             hyid_count = 0
+#             hyid_accum_count = 0
+#             # initialize counter vars
+#             run_accum_mann = 0
+#             group_calb_coef = 0  # initialize counter vars
+#             branch_start = int(
+#                 df_nmerge.loc[index, 'branch_id']
+#             )  # reassign the branch_start var to evaluate on next iteration
+#             # use the code below to withold downstream hydroid_calb_coef values
+#             # (use this for downstream evaluation tests)
+#             '''
+#             lid_count = 0
+#         if not pd.isna(df_nmerge.loc[index,'ahps_lid']):
+#             if df_nmerge.loc[index,'ahps_lid'] == prev_lid:
+#                 lid_count += 1
+#                 # only keep the first 3 HydroID n values
+#                 # (everything else set to null for downstream application)
+#                 if lid_count > 3:
+#                     df_nmerge.loc[index,'hydroid_ManningN'] = np.nan
+#                     df_nmerge.loc[index,'featid_ManningN'] = np.nan
+#             else:
+#                 lid_count = 1
+#             prev_lid = df_nmerge.loc[index,'ahps_lid']
+#             '''
+#         if np.isnan(
+#             df_nmerge.loc[index, 'hydroid_calb_coef']
+#         ):  # check if the hydroid_calb_coef value is nan (indicates a non-calibrated hydroid)
+#             df_nmerge.loc[index, 'accum_dist'] = (
+#                 row['LENGTHKM'] + dist_accum
+#             )  # calculate accumulated river distance
+#             dist_accum += row['LENGTHKM']  # add hydroid length to the dist_accum var
+#             hyid_count = 0  # reset the hydroid counter to 0
+#             df_nmerge.loc[index, 'hyid_accum_count'] = hyid_accum_count  # output the hydroid accum counter
+#             # check if the accum distance is less than Xkm downstream from valid hydroid_calb_coef group value
+#             if dist_accum < down_dist_thresh:
+#                 # only apply the group_calb_coef if there are 2 or more valid hydorids that contributed to the
+#                 # upstream group_calb_coef
+#                 if hyid_accum_count > 1:
+#                     df_nmerge.loc[index, 'group_calb_coef'] = (
+#                         group_calb_coef  # output the group_calb_coef var
+#                     )
+#             else:
+#                 # reset the running average manningn variable (greater than 10km downstream)
+#                 run_avg_mann = 0
+#         # performs the following for hydroids that have a valid hydroid_calb_coef value
+#         else:
+#             dist_accum = 0
+#             hyid_count += 1  # initialize vars
+#             df_nmerge.loc[index, 'accum_dist'] = 0  # output the accum_dist value (set to 0)
+#             if hyid_count == 1:  # checks if this the first in a series of valid hydroid_calb_coef values
+#                 run_accum_mann = 0
+#                 hyid_accum_count = 0  # initialize counter and running accumulated manningN value
+#             # calculate the group_calb_coef (NOTE: this will continue to change as more hydroid values are
+#             # accumulated in the "group" moving downstream)
+#             group_calb_coef = (row['hydroid_calb_coef'] + run_accum_mann) / float(hyid_count)
+#             df_nmerge.loc[index, 'group_calb_coef'] = group_calb_coef  # output the group_calb_coef var
+#             df_nmerge.loc[index, 'hyid_count'] = hyid_count  # output the hyid_count var
+#             run_accum_mann += row[
+#                 'hydroid_calb_coef'
+#             ]  # add current hydroid manningn value to the running accum mann var
+#             hyid_accum_count += 1  # increase the # of hydroid accum counter
+#             df_nmerge.loc[index, 'hyid_accum_count'] = hyid_accum_count  # output the hyid_accum_count var
 
-    df_input_htable = df_input_htable.set_index('HydroID', drop=False)  # set index to the hydroid
-    branch_heads = deque(
-        df_input_htable[df_input_htable['start_catch'] == True]['HydroID'].tolist()
-    )  # create deque of hydroids to define start points in the while loop
-    visited = set()  # create set to keep track of all hydroids that have been accounted for
-    branch_count = 0  # start branch id
-    while branch_heads:
-        hid = branch_heads.popleft()  # pull off left most hydroid from deque of start hydroids
-        Q = deque(
-            df_input_htable[df_input_htable['HydroID'] == hid]['HydroID'].tolist()
-        )  # create a new deque that will be used to populate all relevant downstream hydroids
-        vert_count = 0
-        branch_count += 1
-        while Q:
-            q = Q.popleft()
-            if q not in visited:
-                df_input_htable.loc[df_input_htable.HydroID == q, 'route_count'] = (
-                    vert_count  # assign var with flow order ranking
-                )
-                df_input_htable.loc[df_input_htable.HydroID == q, 'branch_id'] = (
-                    branch_count  # assign var with current branch id
-                )
-                vert_count += 1
-                visited.add(q)
-                # find the id for the next downstream hydroid
-                nextid = df_input_htable.loc[q, 'NextDownID']
-                order = df_input_htable.loc[q, 'order_']  # find the streamorder for the current hydroid
-
-                if nextid not in visited and nextid in df_input_htable.HydroID:
-                    # check if the NextDownID is referenced by more than one hydroid
-                    # (>1 means this is a confluence)
-                    check_confluence = (df_input_htable.NextDownID == nextid).sum() > 1
-                    nextorder = df_input_htable.loc[
-                        nextid, 'order_'
-                    ]  # find the streamorder for the next downstream hydroid
-                    # check if the nextdownid streamorder is greater than the current hydroid order and the
-                    # nextdownid is a confluence (more than 1 upstream hydroid draining to it)
-                    if nextorder > order and check_confluence == True:
-                        branch_heads.append(
-                            nextid
-                        )  # found a terminal point in the network (append to branch_heads for second pass)
-                        # if above conditions are True than stop traversing downstream and move on to next
-                        # starting hydroid
-                        continue
-                    Q.append(nextid)
-    df_input_htable = df_input_htable.reset_index(
-        drop=True
-    )  # reset index (previously using hydroid as index)
-    # sort the dataframe by branch_id and then by route_count
-    # (need this ordered to ensure upstream to downstream ranking for each branch)
-    df_input_htable = df_input_htable.sort_values(['branch_id', 'route_count'])
-    return df_input_htable
-
-
-def group_manningn_calc(df_nmerge, down_dist_thresh):
-    ## Calculate group_calb_coef (mean calb n for consective hydroids) and apply values downsteam to
-    # non-calb hydroids (constrained to first Xkm of hydroids - set downstream diststance var as input arg
-    # df_nmerge = df_nmerge.sort_values(by=['NextDownID'])
-    dist_accum = 0
-    hyid_count = 0
-    hyid_accum_count = 0
-    run_accum_mann = 0
-    group_calb_coef = 0
-    branch_start = 1  # initialize counter and accumulation variables
-    lid_count = 0
-    prev_lid = 'x'
-    for index, row in df_nmerge.iterrows():  # loop through the df (parse by hydroid)
-        if int(df_nmerge.loc[index, 'branch_id']) != branch_start:  # check if start of new branch
-            dist_accum = 0
-            hyid_count = 0
-            hyid_accum_count = 0
-            # initialize counter vars
-            run_accum_mann = 0
-            group_calb_coef = 0  # initialize counter vars
-            branch_start = int(
-                df_nmerge.loc[index, 'branch_id']
-            )  # reassign the branch_start var to evaluate on next iteration
-            # use the code below to withold downstream hydroid_calb_coef values
-            # (use this for downstream evaluation tests)
-            '''
-            lid_count = 0
-        if not pd.isna(df_nmerge.loc[index,'ahps_lid']):
-            if df_nmerge.loc[index,'ahps_lid'] == prev_lid:
-                lid_count += 1
-                # only keep the first 3 HydroID n values
-                # (everything else set to null for downstream application)
-                if lid_count > 3:
-                    df_nmerge.loc[index,'hydroid_ManningN'] = np.nan
-                    df_nmerge.loc[index,'featid_ManningN'] = np.nan
-            else:
-                lid_count = 1
-            prev_lid = df_nmerge.loc[index,'ahps_lid']
-            '''
-        if np.isnan(
-            df_nmerge.loc[index, 'hydroid_calb_coef']
-        ):  # check if the hydroid_calb_coef value is nan (indicates a non-calibrated hydroid)
-            df_nmerge.loc[index, 'accum_dist'] = (
-                row['LENGTHKM'] + dist_accum
-            )  # calculate accumulated river distance
-            dist_accum += row['LENGTHKM']  # add hydroid length to the dist_accum var
-            hyid_count = 0  # reset the hydroid counter to 0
-            df_nmerge.loc[index, 'hyid_accum_count'] = hyid_accum_count  # output the hydroid accum counter
-            # check if the accum distance is less than Xkm downstream from valid hydroid_calb_coef group value
-            if dist_accum < down_dist_thresh:
-                # only apply the group_calb_coef if there are 2 or more valid hydorids that contributed to the
-                # upstream group_calb_coef
-                if hyid_accum_count > 1:
-                    df_nmerge.loc[index, 'group_calb_coef'] = (
-                        group_calb_coef  # output the group_calb_coef var
-                    )
-            else:
-                # reset the running average manningn variable (greater than 10km downstream)
-                run_avg_mann = 0
-        # performs the following for hydroids that have a valid hydroid_calb_coef value
-        else:
-            dist_accum = 0
-            hyid_count += 1  # initialize vars
-            df_nmerge.loc[index, 'accum_dist'] = 0  # output the accum_dist value (set to 0)
-            if hyid_count == 1:  # checks if this the first in a series of valid hydroid_calb_coef values
-                run_accum_mann = 0
-                hyid_accum_count = 0  # initialize counter and running accumulated manningN value
-            # calculate the group_calb_coef (NOTE: this will continue to change as more hydroid values are
-            # accumulated in the "group" moving downstream)
-            group_calb_coef = (row['hydroid_calb_coef'] + run_accum_mann) / float(hyid_count)
-            df_nmerge.loc[index, 'group_calb_coef'] = group_calb_coef  # output the group_calb_coef var
-            df_nmerge.loc[index, 'hyid_count'] = hyid_count  # output the hyid_count var
-            run_accum_mann += row[
-                'hydroid_calb_coef'
-            ]  # add current hydroid manningn value to the running accum mann var
-            hyid_accum_count += 1  # increase the # of hydroid accum counter
-            df_nmerge.loc[index, 'hyid_accum_count'] = hyid_accum_count  # output the hyid_accum_count var
-
-    ## Delete unnecessary intermediate outputs
-    if 'hyid_count' in df_nmerge.columns:
-        df_nmerge = df_nmerge.drop(
-            ['hyid_count', 'accum_dist', 'hyid_accum_count'], axis=1, errors='ignore'
-        )  # drop hydroid counter if it exists
-    ## drop accum vars from group calc
-    # df_nmerge = df_nmerge.drop(['accum_dist','hyid_accum_count'], axis=1)
-    return df_nmerge
+#     ## Delete unnecessary intermediate outputs
+#     if 'hyid_count' in df_nmerge.columns:
+#         df_nmerge = df_nmerge.drop(
+#             ['hyid_count', 'accum_dist', 'hyid_accum_count'], axis=1, errors='ignore'
+#         )  # drop hydroid counter if it exists
+#     ## drop accum vars from group calc
+#     # df_nmerge = df_nmerge.drop(['accum_dist','hyid_accum_count'], axis=1)
+#     return df_nmerge
