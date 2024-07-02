@@ -22,12 +22,14 @@ import random
 from utils.shared_variables import DOWNSTREAM_THRESHOLD, ROUGHNESS_MAX_THRESH, ROUGHNESS_MIN_THRESH
 
 mannN_file_aibased = "/efs-drives/fim-dev-efs/fim-data/inputs/rating_curve/variable_roughness/ml_outputs_v1.01.parquet"
-fim_dir = "/home/rdp-user/outputs/mno_11010004_all_off_mn1206/"
-huc = "11010004"    
-
-Stage_bankfull = "Stage_bankfull"
+fim_dir = "/home/rdp-user/outputs/mno_11010004_cal_off/"
+projectDir = "/home/rdp-user/projects/dev-roughness-optimization/" #os.getenv('projectDir')
+huc = "11010004"
 optzN_on = True
-output_suffix = ""
+output_suffix = "" #optz_mannN
+synth_test_path = "/efs-drives/fim-dev-efs/fim-home/heidi.safa/roughness_optimization/alphatest_metrics_optz_mannN.csv"
+pfim_csv = "/efs-drives/fim-dev-efs/fim-data/previous_fim/fim_4_5_2_0/fim_4_5_2_0_metrics.csv"
+
 def initialize_mannN (fim_dir, huc, mannN_file_aibased):
 
     log_text = f'Initializing manningN for HUC: {huc}\n'
@@ -67,10 +69,12 @@ def initialize_mannN (fim_dir, huc, mannN_file_aibased):
     mannN_ai_df['overbank_n_optz'] = mannN_ai_df['overbank_n_optz'].clip(lower=ob_lower_optz, upper=ob_upper_optz)
     # mannN_ai_df.columns
 
-    return mannN_ai_df
+    initial_mannN_df = mannN_ai_df[['feature_id', 'channel_n_optz', 'overbank_n_optz']]
+
+    return initial_mannN_df
     
 
-def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull, optzN_on, output_suffix): # branch_id, htable_filename, huc_output_dir
+def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on, output_suffix):
 
     log_text = f'Updating hydro_table with new set of manningN for HUC: {huc}\n'
 
@@ -84,8 +88,8 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
         if os.path.isfile(src_full):
             src_all_branches_path.append(src_full)
 
-    # Update src parameters with ***********************
-    for src_path in src_all_branches_path[1:2]:
+    # Update src with updated Q and n
+    for src_path in src_all_branches_path:
 
         src_name = os.path.basename(src_path)
         branch = src_name.split(".")[0].split("_")[-1]
@@ -95,7 +99,7 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
         src_df = pd.read_csv(src_path, dtype={'feature_id': 'int64'}) #low_memory=False
 
         ## Check the Stage_bankfull exists in the src (channel ratio column that the user specified) 
-        if Stage_bankfull not in src_df.columns:
+        if "Stage_bankfull" not in src_df.columns:
             print(
                 'WARNING --> '
                 + str(huc)
@@ -103,7 +107,7 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
                 + str(branch)
                 + src_path
                 + ' does not contain the specified channel ratio column: '
-                + Stage_bankfull
+                + 'Stage_bankfull'
             )
             print('Skipping --> ' + str(huc) + '  branch id: ' + str(branch))
             log_text += (
@@ -113,7 +117,7 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
                 + str(branch)
                 + src_path
                 + ' does not contain the specified channel ratio column: '
-                + Stage_bankfull
+                + 'Stage_bankfull'
                 + '\n'
             )
         else:
@@ -125,11 +129,11 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
                         axis=1,
                     )                
                 ## Merge (crosswalk) the df of Manning's n with the SRC df
-                src_df = src_df.merge(initial_mannN, how='left', on='feature_id')
+                src_df = src_df.merge(mannN_fid_df, how='left', on='feature_id')
                 # src_df.columns
                 ## Calculate composite Manning's n using the channel geometry ratio attribute given by user
-                src_df['manningN_optz'] = (src_df[Stage_bankfull] * src_df['channel_n_optz']) + (
-                    (1.0 - src_df[Stage_bankfull]) * src_df['overbank_n_optz']
+                src_df['manningN_optz'] = (src_df['Stage_bankfull'] * src_df['channel_n_optz']) + (
+                    (1.0 - src_df['Stage_bankfull']) * src_df['overbank_n_optz']
                 )
 
                 ## Define the channel geometry variable names to use from the src
@@ -153,7 +157,9 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
                     src_df['optzN_on'] == False, src_df['ManningN'], src_df['manningN_optz']
                 )  # reset the ManningN value back to the original if optzN_on=false
 
-                ## Output new SRC with bankfull column **************************************************************************************************
+                ## Output new SRC with bankfull column
+                if output_suffix != "":
+                    src_path = os.path.splitext(src_path)[0] + output_suffix + '.csv'
                 src_df.to_csv(src_path, index=False)
 
                 ## Output new hydroTable with updated discharge and ManningN column
@@ -193,14 +199,14 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
             except Exception as ex:
                 summary = traceback.StackSummary.extract(traceback.walk_stack(None))
                 print(
-                    'WARNING: ' + str(huc) + '  branch id: ' + str(branch) + " manningN optimization failed for some reason"
+                    'WARNING: ' + str(huc) + '  branch id: ' + str(branch) + " updating hydro_table failed for some reason"
                 )
                 log_text += (
                     'ERROR --> '
                     + str(huc)
                     + '  branch id: '
                     + str(branch)
-                    + " manningN optimization failed (details: "
+                    + " updating hydro_table failed (details: "
                     + (f"*** {ex}")
                     + (''.join(summary.format()))
                     + '\n'
@@ -210,25 +216,18 @@ def update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN, Stage_bankfull,
         return log_text
 
 
-def manningN_objective_fun(fim_dir, huc): # branch_id, htable_filename, huc_output_dir
+def objective_func_alpha_test(fim_dir, huc, mannN_fid_df, projectDir, synth_test_path, pfim_csv, optzN_on, output_suffix):
 
-    log_text = f'Running Alphat Test for HUC: {huc}\n'
+    log_text = update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on, output_suffix)
 
-    # Call post-processing scripts and run them
-    srcDir = "/home/rdp-user/projects/dev-roughness-optimization/inundation-mapping/src/" # os.getenv('srcDir')
-    toolDir = "/home/rdp-user/projects/dev-roughness-optimization/inundation-mapping/tools/" # os.getenv('toolDir')
-    projectDir = os.getenv('projectDir')
+    log_text += f'Running Alphat Test for HUC: {huc}\n'
 
-    load_dotenv(f'{srcDir}/bash_variables.env')
-    load_dotenv(f'{projectDir}/config/params_template.env')
-
-    # Running synthesize_test_cases
+    # Call synthesize_test_cases script and run them
+    toolDir = os.path.join(projectDir, "inundation-mapping", "tools")
     mannN_optz = os.path.basename(os.path.dirname(fim_dir))
-    synth_test_path = "/efs-drives/fim-dev-efs/fim-home/heidi.safa/roughness_optimization/alphatest_metrics_optz_mannN.csv"
-    pfim_csv = "/efs-drives/fim-dev-efs/fim-data/previous_fim/fim_4_5_2_0/fim_4_5_2_0_metrics.csv"
     os.system(f"python3 {toolDir}/synthesize_test_cases.py -c DEV -e GMS -v {mannN_optz} -jh 2 -jb 3 -m {synth_test_path} -o -pcsv {pfim_csv}")
 
-    # *********************************************************************************
+    # *****************************************************
     # Load synth_test_cvs
     synth_test_df = pd.read_csv(synth_test_path)
     # Read BLE test cases if HUC8 has them **************************************************************************************************
@@ -244,43 +243,35 @@ def manningN_objective_fun(fim_dir, huc): # branch_id, htable_filename, huc_outp
     true_positives_500 = synth_test_df["true_positives_count"][1]
     false_positives_500 = synth_test_df["false_positives_count"][1] # min
 
-    obj_fun_mannN = false_negatives_100 + false_positives_100 + false_negatives_500 + false_positives_500
+    error_mannN = false_negatives_100 + false_positives_100 + false_negatives_500 + false_positives_500
 
     log_text += 'Alphat Test Completed: ' + str(huc)
 
-    log_text += f'Estimating Stage_bankfull for HUC: {huc}\n'
-    from src import identify_src_bankfull
-    identify_src_bankfull()
-
-    return obj_fun_mannN, log_text
+    return error_mannN, log_text
 
 
-def apply_manningN_optimization(mannN_file_aibased, fim_dir, huc, Stage_bankfull, optzN_on, output_suffix):
-
-    initial_mannN_df = initialize_mannN (fim_dir, huc, mannN_file_aibased)
-    log_text_1 = update_hydrotable_with_newMannN(fim_dir, huc, initial_mannN_df, Stage_bankfull, optzN_on, output_suffix)
-    obj_fun_mannN, log_text_2 = manningN_objective_fun(fim_dir, huc)
-
-
-    return obj_fun_mannN
-
-initial_guess = mannN_file_aibased
-args=(fim_dir, huc, Stage_bankfull, optzN_on, output_suffix)
-result = minimize(apply_manningN_optimization, initial_guess, args = args, method="SLSQP")
+initial_mannN_df = initialize_mannN(fim_dir, huc, mannN_file_aibased)
+initial_guess = initial_mannN_df
+args=(fim_dir, huc, optzN_on, output_suffix)
+result = minimize(objective_func_alpha_test, initial_guess, args = args, method="SLSQP")
 optimal_n = result.x
 optimal_alpha = result.fun
 
 # Define the function Q(n, a, b)
-def Q(n, a, b):
-	return n**2 + a**2 + b**2
+def Q_fun(n, R, V, S):
+    q = (1/n)*(V)*(R**(2./3.))*(S**(0.5))
+    return q
 
 # Define the function alpha(Q)
-def alpha(Q):
-	return Q**2
+def alpha(q):
+    error = q**2
+    return error
 
 # Define the objective function to minimize
-def objective(n, a, b):
-	return alpha(Q(n, a, b))
+def objective(n, R, V, S):
+    q = Q_fun(n, R, V, S)
+    error = alpha(q)
+    return error
 
 # Initial guess for n
 initial_guess = 1
