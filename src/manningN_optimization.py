@@ -1,35 +1,374 @@
 
+import json
 import argparse
-import datetime as dt
+from datetime import datetime
 import multiprocessing
+from multiprocessing import Pool
 import os
-from os.path import isdir, isfile, join
+from os.path import join
 import re
 import sys
-import subprocess
-from dotenv import load_dotenv
-from collections import deque
-from multiprocessing import Pool
 import traceback
 import warnings
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
-from geopandas.tools import sjoin
 from scipy.optimize import minimize
 import random
 
-from utils.shared_variables import DOWNSTREAM_THRESHOLD, ROUGHNESS_MAX_THRESH, ROUGHNESS_MIN_THRESH
+from utils.run_test_case import Test_Case
+from utils.tools_shared_variables import (
+    AHPS_BENCHMARK_CATEGORIES,
+    MAGNITUDE_DICT,
+    PREVIOUS_FIM_DIR,
+    TEST_CASES_DIR,
+)
 
-# mannN_file_aibased = "/efs-drives/fim-dev-efs/fim-data/inputs/rating_curve/variable_roughness/ml_outputs_v1.01.parquet"
-# fim_dir = "/home/rdp-user/outputs/mno_11010004_cal_off2/"
-# projectDir = "/home/rdp-user/projects/dev-roughness-optimization/" #os.getenv('projectDir')
-# huc = "11010004"
-# optzN_on = True
-# # output_suffix = "" #optz_mannN
-# synth_test_path = "/efs-drives/fim-dev-efs/fim-home/heidi.safa/roughness_optimization/alphatest_metrics_optz_mannN2.csv"
-# pfim_csv = "/efs-drives/fim-dev-efs/fim-data/previous_fim/fim_4_5_2_0/fim_4_5_2_0_metrics.csv"
+# *********************************************************
+def create_master_metrics_csv(prev_metrics_csv, fim_version):
+    """
+    This function searches for and collates metrics into a single CSV file that can queried database-style.
+        The CSV is an input to eval_plots.py.
+        This function automatically looks for metrics produced for official versions and loads them into
+            memory to be written to the output CSV.
+
+    Args:
+        master_metrics_csv_output (str)    : Full path to CSV output.
+                                                If a file already exists at this path, it will be overwritten.
+        dev_versions_to_include_list (list): A list of non-official FIM version names.
+                                                If a user supplied information on the command line using the
+                                                -dc flag, then this function will search for metrics in the
+                                                "testing_versions" library of metrics and include them in
+                                                the CSV output.
+    """
+
+
+    # Default to processing all possible versions in PREVIOUS_FIM_DIR.
+    config = "DEV"
+    iteration_list = ['official', 'testing']
+    prev_versions_to_include_list = []
+    dev_versions_to_include_list = []
+
+    prev_versions_to_include_list = os.listdir(PREVIOUS_FIM_DIR)
+    if config == 'DEV':  # development fim model results
+        dev_versions_to_include_list = [fim_version]
+
+    # Construct header
+    metrics_to_write = [
+        'true_negatives_count',
+        'false_negatives_count',
+        'true_positives_count',
+        'false_positives_count',
+        'contingency_tot_count',
+        'cell_area_m2',
+        'TP_area_km2',
+        'FP_area_km2',
+        'TN_area_km2',
+        'FN_area_km2',
+        'contingency_tot_area_km2',
+        'predPositive_area_km2',
+        'predNegative_area_km2',
+        'obsPositive_area_km2',
+        'obsNegative_area_km2',
+        'positiveDiff_area_km2',
+        'CSI',
+        'FAR',
+        'TPR',
+        'TNR',
+        'PND',
+        'PPV',
+        'NPV',
+        'ACC',
+        'Bal_ACC',
+        'MCC',
+        'EQUITABLE_THREAT_SCORE',
+        'PREVALENCE',
+        'BIAS',
+        'F1_SCORE',
+        'TP_perc',
+        'FP_perc',
+        'TN_perc',
+        'FN_perc',
+        'predPositive_perc',
+        'predNegative_perc',
+        'obsPositive_perc',
+        'obsNegative_perc',
+        'positiveDiff_perc',
+        'masked_count',
+        'masked_perc',
+        'masked_area_km2',
+    ]
+
+    # Create table header
+    additional_header_info_prefix = ['version', 'nws_lid', 'magnitude', 'huc']
+    list_to_write = [
+        additional_header_info_prefix
+        + metrics_to_write
+        + ['full_json_path']
+        + ['flow']
+        + ['benchmark_source']
+        + ['extent_config']
+        + ["calibrated"]
+    ]
+
+    # add in composite of versions (used for previous FIM3 versions)
+    if "official" in iteration_list:
+        composite_versions = [v.replace('_ms', '_comp') for v in prev_versions_to_include_list if '_ms' in v]
+        prev_versions_to_include_list += composite_versions
+
+    # Iterate through 5 benchmark sources
+    for benchmark_source in ['ble', 'nws', 'usgs', 'ifc', 'ras2fim']:
+        benchmark_test_case_dir = os.path.join(TEST_CASES_DIR, benchmark_source + '_test_cases')
+        test_cases_list = [d for d in os.listdir(benchmark_test_case_dir) if re.match(r'\d{8}_\w{3,7}', d)]
+
+        if benchmark_source in ['ble', 'ifc', 'ras2fim']:
+            magnitude_list = MAGNITUDE_DICT[benchmark_source]
+
+            # Iterate through available test cases
+            for each_test_case in test_cases_list:
+                try:
+                    # Get HUC id
+                    int(each_test_case.split('_')[0])
+                    huc = each_test_case.split('_')[0]
+
+                    # Update filepaths based on whether the official or dev versions should be included
+                    for iteration in iteration_list:
+                        if (
+                            iteration == "official"
+                        ):  # and str(pfiles) == "True": # "official" refers to previous finalized model versions
+                            versions_to_crawl = os.path.join(
+                                benchmark_test_case_dir, each_test_case, 'official_versions'
+                            )
+                            versions_to_aggregate = prev_versions_to_include_list
+
+                        if (
+                            iteration == "testing"
+                        ):  # "testing" refers to the development model version(s) being evaluated
+                            versions_to_crawl = os.path.join(
+                                benchmark_test_case_dir, each_test_case, 'testing_versions'
+                            )
+                            versions_to_aggregate = dev_versions_to_include_list
+
+                        # Pull version info from filepath
+                        for magnitude in magnitude_list:
+                            for version in versions_to_aggregate:
+                                if '_ms' in version:
+                                    extent_config = 'MS'
+                                elif ('_fr' in version) or (version == 'fim_2_3_3'):
+                                    extent_config = 'FR'
+                                else:
+                                    extent_config = 'COMP'
+                                if "_c" in version and version.split('_c')[1] == "":
+                                    calibrated = "yes"
+                                else:
+                                    calibrated = "no"
+                                version_dir = os.path.join(versions_to_crawl, version)
+                                magnitude_dir = os.path.join(version_dir, magnitude)
+
+                                # Add metrics from file to metrics table ('list_to_write')
+                                if os.path.exists(magnitude_dir):
+                                    magnitude_dir_list = os.listdir(magnitude_dir)
+                                    for f in magnitude_dir_list:
+                                        if '.json' in f:
+                                            flow = 'NA'
+                                            nws_lid = "NA"
+                                            sub_list_to_append = [version, nws_lid, magnitude, huc]
+                                            full_json_path = os.path.join(magnitude_dir, f)
+                                            if os.path.exists(full_json_path):
+                                                stats_dict = json.load(open(full_json_path))
+                                                for metric in metrics_to_write:
+                                                    sub_list_to_append.append(stats_dict[metric])
+                                                sub_list_to_append.append(full_json_path)
+                                                sub_list_to_append.append(flow)
+                                                sub_list_to_append.append(benchmark_source)
+                                                sub_list_to_append.append(extent_config)
+                                                sub_list_to_append.append(calibrated)
+
+                                                list_to_write.append(sub_list_to_append)
+                except ValueError:
+                    pass
+
+        # Iterate through AHPS benchmark data
+        if benchmark_source in AHPS_BENCHMARK_CATEGORIES:
+            test_cases_list = os.listdir(benchmark_test_case_dir)
+
+            for each_test_case in test_cases_list:
+                try:
+                    # Get HUC id
+                    int(each_test_case.split('_')[0])
+                    huc = each_test_case.split('_')[0]
+
+                    # Update filepaths based on whether the official or dev versions should be included
+                    for iteration in iteration_list:
+                        if iteration == "official":  # "official" refers to previous finalized model versions
+                            versions_to_crawl = os.path.join(
+                                benchmark_test_case_dir, each_test_case, 'official_versions'
+                            )
+                            versions_to_aggregate = prev_versions_to_include_list
+
+                        if (
+                            iteration == "testing"
+                        ):  # "testing" refers to the development model version(s) being evaluated
+                            versions_to_crawl = os.path.join(
+                                benchmark_test_case_dir, each_test_case, 'testing_versions'
+                            )
+                            versions_to_aggregate = dev_versions_to_include_list
+
+                        # Pull model info from filepath
+                        for magnitude in ['action', 'minor', 'moderate', 'major']:
+                            for version in versions_to_aggregate:
+                                if '_ms' in version:
+                                    extent_config = 'MS'
+                                elif ('_fr' in version) or (version == 'fim_2_3_3'):
+                                    extent_config = 'FR'
+                                else:
+                                    extent_config = 'COMP'
+                                if "_c" in version and version.split('_c')[1] == "":
+                                    calibrated = "yes"
+                                else:
+                                    calibrated = "no"
+
+                                version_dir = os.path.join(versions_to_crawl, version)
+                                magnitude_dir = os.path.join(version_dir, magnitude)
+
+                                if os.path.exists(magnitude_dir):
+                                    magnitude_dir_list = os.listdir(magnitude_dir)
+                                    for f in magnitude_dir_list:
+                                        if '.json' in f and 'total_area' not in f:
+                                            nws_lid = f[:5]
+                                            sub_list_to_append = [version, nws_lid, magnitude, huc]
+                                            full_json_path = os.path.join(magnitude_dir, f)
+                                            flow = ''
+                                            if os.path.exists(full_json_path):
+                                                # Get flow used to map
+                                                flow_file = os.path.join(
+                                                    benchmark_test_case_dir,
+                                                    'validation_data_' + benchmark_source,
+                                                    huc,
+                                                    nws_lid,
+                                                    magnitude,
+                                                    'ahps_'
+                                                    + nws_lid
+                                                    + '_huc_'
+                                                    + huc
+                                                    + '_flows_'
+                                                    + magnitude
+                                                    + '.csv',
+                                                )
+                                                if os.path.exists(flow_file):
+                                                    with open(flow_file, newline='') as csv_file:
+                                                        reader = csv.reader(csv_file)
+                                                        next(reader)
+                                                        for row in reader:
+                                                            flow = row[1]
+
+                                                # Add metrics from file to metrics table ('list_to_write')
+                                                stats_dict = json.load(open(full_json_path))
+                                                for metric in metrics_to_write:
+                                                    sub_list_to_append.append(stats_dict[metric])
+                                                sub_list_to_append.append(full_json_path)
+                                                sub_list_to_append.append(flow)
+                                                sub_list_to_append.append(benchmark_source)
+                                                sub_list_to_append.append(extent_config)
+                                                sub_list_to_append.append(calibrated)
+                                                list_to_write.append(sub_list_to_append)
+                except ValueError:
+                    pass
+
+    # If previous metrics are provided: read in previously compiled metrics and join to calcaulated metrics
+    if prev_metrics_csv is not None:
+        prev_metrics_df = pd.read_csv(prev_metrics_csv)
+
+        # Put calculated metrics into a dataframe and set the headers
+        df_to_write_calc = pd.DataFrame(list_to_write)
+        df_to_write_calc.columns = df_to_write_calc.iloc[0]
+        df_to_write_calc = df_to_write_calc[1:]
+
+        # Join the calculated metrics and the previous metrics dataframe
+        df_to_write = pd.concat([df_to_write_calc, prev_metrics_df], axis=0)
+
+    else:
+        df_to_write = pd.DataFrame(list_to_write)
+        df_to_write.columns = df_to_write.iloc[0]
+        df_to_write = df_to_write[1:]
+
+    # Save aggregated compiled metrics ('df_to_write') as a CSV
+    # df_to_write.to_csv(master_metrics_csv_output, index=False)
+
+    return df_to_write
+
+
+# *********************************************************
+def run_test_cases(prev_metrics_csv, fim_version):
+    """
+    This function
+    """
+
+    print("================================")
+    print("Start synthesize test cases")
+    start_time = datetime.now()
+    dt_string = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    print(f"started: {dt_string}")
+    print()
+
+    # Default to processing all possible versions in PREVIOUS_FIM_DIR.
+    fim_version = fim_version #"all"
+
+    # Create a list of all test_cases for which we have validation data
+    archive_results = False
+    benchmark_category = "all"
+    all_test_cases = Test_Case.list_all_test_cases(
+        version=fim_version,
+        archive=archive_results,
+        benchmark_categories=[] if benchmark_category == "all" else [benchmark_category],
+    )
+
+    # Check whether a previous metrics CSV has been provided and, if so, make sure the CSV exists
+    if prev_metrics_csv is not None:
+        if not os.path.exists(prev_metrics_csv):
+            print(f"Error: File does not exist at {prev_metrics_csv}")
+            sys.exit(1)
+        else:
+            print(f"Metrics will be combined with previous metric CSV: {prev_metrics_csv}")
+            print()
+    else:
+        print("ALERT: A previous metric CSV has not been provided (-pcsv) - this is optional.")
+        print()
+
+    model = "GMS"
+    for test_case_class in all_test_cases:
+        if not os.path.exists(test_case_class.fim_dir):
+            continue
+        
+        overwrite=True,
+        verbose=False,
+        alpha_test_args = {
+            'calibrated': False,
+            'model': model,
+            'mask_type': 'huc',
+            'overwrite': overwrite,
+            'verbose': verbose,
+            'gms_workers': 1,
+        }
+
+        test_case_class.alpha_test(**alpha_test_args)
+
+        metrics_df = create_master_metrics_csv(prev_metrics_csv, fim_version)
+
+    print("================================")
+    print("End synthesize test cases")
+
+    end_time = datetime.now()
+    dt_string = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    print(f"ended: {dt_string}")
+
+    # Calculate duration
+    time_duration = end_time - start_time
+    print(f"Duration: {str(time_duration).split('.')[0]}")
+    print()
+
+    return metrics_df
+
 
 # *********************************************************
 def initialize_mannN_ai (fim_dir, huc, mannN_file_aibased):
@@ -77,7 +416,7 @@ def initialize_mannN_ai (fim_dir, huc, mannN_file_aibased):
     
 
 # *********************************************************
-def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on):
+def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df):
 
     log_text = f'Updating hydro_table with new set of manningN for HUC: {huc}\n'
 
@@ -99,7 +438,7 @@ def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on):
                 log_text += f'  Branch: {branch}\n'
 
                 log_text += f'Reading the src_full_crosswalked.csv: HUC{str(huc)}, branch id: {str(branch)}\n'
-                src_df = pd.read_csv(src_path, dtype={'feature_id': 'int64'}) #low_memory=False
+                src_df = pd.read_csv(src_path, dtype={'feature_id': 'int64'}, low_memory=False) #
 
                 ## Check the Stage_bankfull exists in the src (channel ratio column that the user specified) 
                 if "Stage_bankfull" not in src_df.columns:
@@ -150,6 +489,7 @@ def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on):
                         / src_df['manningN_optz']
                     )
 
+                    optzN_on = True
                     src_df['optzN_on'] = optzN_on
                     # ## Use the default discharge column when optzN is not being applied
                     # src_df['Discharge(cms)_optzN'] = np.where(
@@ -177,7 +517,7 @@ def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on):
                     # Read hydro_table file
                     htable_name = f'hydroTable_{branch}.csv'
                     htable_filename = join(fim_huc_dir, 'branches', branch, htable_name)
-                    df_htable = pd.read_csv(htable_filename, dtype={'HUC': str})
+                    df_htable = pd.read_csv(htable_filename, dtype={'HUC': str}, low_memory=False)
 
                     ## drop the previously modified discharge columns to be replaced with updated version
                     # df_htable.columns
@@ -220,7 +560,7 @@ def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on):
 
 
 # *********************************************************
-def objective_function(mannN_values, *obj_func_args): #, fim_dir, huc, projectDir, synth_test_path, pfim_csv, optzN_on
+def objective_function(mannN_values, *obj_func_args): #, fim_dir, huc, pfim_csv, ## projectDir, synth_test_path, 
     # This function update hydrotable with mannN and Q,
     # Run alpha test, and defines the objective function
 
@@ -229,17 +569,21 @@ def objective_function(mannN_values, *obj_func_args): #, fim_dir, huc, projectDi
     mannN_fid_df['channel_n_optz'] = mannN_values
     mannN_fid_df['overbank_n_optz'] = mannN_values
 
-    log_text = update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df, optzN_on)
+    log_text = update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df)
 
+    print(f'Running Alphat Test for HUC: {huc}\n')
     log_text += f'Running Alphat Test for HUC: {huc}\n'
 
     # Call synthesize_test_cases script and run them
-    toolDir = os.path.join(projectDir, "tools")
+    # toolDir = os.path.join(projectDir, "tools")
     mannN_optz = os.path.basename(os.path.dirname(fim_dir))
-    os.system(f"python3 {toolDir}/synthesize_test_cases.py -c DEV -e GMS -v {mannN_optz} -jh 2 -jb 3 -m {synth_test_path} -o -pcsv {pfim_csv}")
 
-    # Load alpha test metrics (synth_test_cvs)
-    synth_test_df = pd.read_csv(synth_test_path)
+    # os.system(f"python3 {toolDir}/synthesize_test_cases.py -c DEV -e GMS -v {mannN_optz} -jh 2 -jb 3 -m {synth_test_path} -o -pcsv {pfim_csv}")
+
+    # # Load alpha test metrics (synth_test_cvs)
+    # synth_test_df = pd.read_csv(synth_test_path)
+
+    synth_test_df = create_master_metrics_csv(pfim_csv, mannN_optz)
     # Read BLE test cases if HUC8 has them **************************************************************************************************
     # 100-year flood 
     false_neg_100 = synth_test_df["FN_perc"][0] # min
@@ -253,6 +597,7 @@ def objective_function(mannN_values, *obj_func_args): #, fim_dir, huc, projectDi
     error_mannN = false_neg_100 + false_pos_100 + false_neg_500 + false_pos_500
 
     log_text += 'Completed: ' + str(huc)
+    print("first run completed")
 
     return error_mannN #, log_text
 
@@ -315,27 +660,20 @@ if __name__ == '__main__':
         required=True,
         type=bool,
     )
-    parser.add_argument(
-        '-optzN_on',
-        '--optzN_on',
-        help="Switch between mannN_optimization off or on (True or False)",
-        required=True,
-        type=str,
-    )
-    parser.add_argument(
-        '-synth_path',
-        '--synth_test_path',
-        help="Path to a csv file to save alpha test metrics",
-        required=True,
-        type=str,
-    )
-    parser.add_argument(
-        '-projDir',
-        '--projectDir',
-        help="Path to the project directory (dev)",
-        required=True,
-        type=str,
-    )
+    # parser.add_argument(
+    #     '-synth_path',
+    #     '--synth_test_path',
+    #     help="Path to a csv file to save alpha test metrics",
+    #     required=True,
+    #     type=str,
+    # )
+    # parser.add_argument(
+    #     '-projDir',
+    #     '--projectDir',
+    #     help="Path to the project directory (dev)",
+    #     required=True,
+    #     type=str,
+    # )
     # parser.add_argument(
     #     '-j',
     #     '--number-of-jobs',
@@ -350,10 +688,9 @@ if __name__ == '__main__':
     fim_dir = args['fim_dir']
     huc = args['huc']
     mannN_file_aibased = args['mannN_file_aibased']
-    optzN_on = args['optzN_on']
     pfim_csv = args['pfim_csv']
-    synth_test_path = args['synth_test_path']
-    projectDir = args['projectDir']
+    # synth_test_path = args['synth_test_path']
+    # projectDir = args['projectDir']
     # number_of_jobs = args['number_of_jobs']
     
     # *********************************************************
@@ -367,33 +704,40 @@ if __name__ == '__main__':
     bounds = [(0.01, 0.5) for _ in range(len(mannN_init))]
 
     # Define rest of arguments for objective_function
-    obj_func_args = (fim_dir, huc, projectDir, synth_test_path, pfim_csv, optzN_on)
+    obj_func_args = (fim_dir, huc, pfim_csv) #projectDir, synth_test_path, 
 
     # Define the constraints
-    alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
+    # alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
 
-    constraints = (
-        {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[0] - 0},  # a > 0
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0]},  # a < 100
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[1] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[1]},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[2] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[2]},    
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[3] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[3]},    
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[4] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[4]},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[5] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[5]},    
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[6] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[6]},    
-        # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[7] - 0},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[7]},
+    # print(alpha_metrics)
 
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0] - alpha_test_metrics_analysis(synth_test_path)[1] - alpha_test_metrics_analysis(synth_test_path)[2] - alpha_test_metrics_analysis(synth_test_path)[3]},
-        # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[4] - alpha_test_metrics_analysis(synth_test_path)[5] - alpha_test_metrics_analysis(synth_test_path)[6] - alpha_test_metrics_analysis(synth_test_path)[7]},
-    )
+    # constraints = (
+    #     {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[0] - 0},  # a > 0
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0]},  # a < 100
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[1] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[1]},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[2] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[2]},    
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[3] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[3]},    
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[4] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[4]},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[5] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[5]},    
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[6] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[6]},    
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[7] - 0},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[7]},
+
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0] - alpha_test_metrics_analysis(synth_test_path)[1] - alpha_test_metrics_analysis(synth_test_path)[2] - alpha_test_metrics_analysis(synth_test_path)[3]},
+    #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[4] - alpha_test_metrics_analysis(synth_test_path)[5] - alpha_test_metrics_analysis(synth_test_path)[6] - alpha_test_metrics_analysis(synth_test_path)[7]},
+    # )
 
     # Run the optimization using the SLSQP algorithm
-    res = minimize(objective_function, mannN_init, method="SLSQP", bounds=bounds, args=obj_func_args, constraints=constraints)
+    res = minimize(objective_function, mannN_init, method="SLSQP", bounds=bounds, args=obj_func_args) #, constraints=constraints
+
+    alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
+
+    print(alpha_metrics)
+    
     print(res.x, res.fun)
