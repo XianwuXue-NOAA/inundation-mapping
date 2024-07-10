@@ -4,28 +4,34 @@ import argparse
 from datetime import datetime
 import multiprocessing
 from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 import os
 from os.path import join
 import re
 import sys
 import traceback
 import warnings
+import csv
 
 import geopandas as gpd
 import pandas as pd
 from scipy.optimize import minimize
 import random
 
-from utils.run_test_case import Test_Case
-from utils.tools_shared_variables import (
+from run_test_case import Test_Case
+from tools_shared_variables import (
     AHPS_BENCHMARK_CATEGORIES,
     MAGNITUDE_DICT,
     PREVIOUS_FIM_DIR,
     TEST_CASES_DIR,
 )
 
+# fim_dir = "/home/rdp-user/outputs/mno_11010004_cal_off/" 
+# huc = "11010004" 
+# mannN_file_aibased = "/efs-drives/fim-dev-efs/fim-data/inputs/rating_curve/variable_roughness/ml_outputs_v1.01.parquet"
+
 # *********************************************************
-def create_master_metrics_csv(prev_metrics_csv, fim_version):
+def create_master_metrics_csv(fim_version): #prev_metrics_csv, 
     """
     This function searches for and collates metrics into a single CSV file that can queried database-style.
         The CSV is an input to eval_plots.py.
@@ -45,7 +51,15 @@ def create_master_metrics_csv(prev_metrics_csv, fim_version):
 
     # Default to processing all possible versions in PREVIOUS_FIM_DIR.
     config = "DEV"
-    iteration_list = ['official', 'testing']
+    # Specify which results to iterate through
+    if config == 'DEV':
+        iteration_list = [
+            'official',
+            'testing',
+        ]  # iterating through official model results AND testing model(s)
+    else:
+        iteration_list = ['official']  # only iterating through official model results
+
     prev_versions_to_include_list = []
     dev_versions_to_include_list = []
 
@@ -275,23 +289,26 @@ def create_master_metrics_csv(prev_metrics_csv, fim_version):
                 except ValueError:
                     pass
 
-    # If previous metrics are provided: read in previously compiled metrics and join to calcaulated metrics
-    if prev_metrics_csv is not None:
-        prev_metrics_df = pd.read_csv(prev_metrics_csv)
+    # # If previous metrics are provided: read in previously compiled metrics and join to calcaulated metrics
+    # if prev_metrics_csv is not None:
+    #     prev_metrics_df = pd.read_csv(prev_metrics_csv)
 
-        # Put calculated metrics into a dataframe and set the headers
-        df_to_write_calc = pd.DataFrame(list_to_write)
-        df_to_write_calc.columns = df_to_write_calc.iloc[0]
-        df_to_write_calc = df_to_write_calc[1:]
+    #     # Put calculated metrics into a dataframe and set the headers
+    #     df_to_write_calc = pd.DataFrame(list_to_write)
+    #     df_to_write_calc.columns = df_to_write_calc.iloc[0]
+    #     df_to_write_calc = df_to_write_calc[1:]
 
-        # Join the calculated metrics and the previous metrics dataframe
-        df_to_write = pd.concat([df_to_write_calc, prev_metrics_df], axis=0)
+    #     # Join the calculated metrics and the previous metrics dataframe
+    #     df_to_write = pd.concat([df_to_write_calc, prev_metrics_df], axis=0)
 
-    else:
-        df_to_write = pd.DataFrame(list_to_write)
-        df_to_write.columns = df_to_write.iloc[0]
-        df_to_write = df_to_write[1:]
+    # else:
+    #     df_to_write = pd.DataFrame(list_to_write)
+    #     df_to_write.columns = df_to_write.iloc[0]
+    #     df_to_write = df_to_write[1:]
 
+    df_to_write = pd.DataFrame(list_to_write)
+    df_to_write.columns = df_to_write.iloc[0]
+    df_to_write = df_to_write[1:]
     # Save aggregated compiled metrics ('df_to_write') as a CSV
     # df_to_write.to_csv(master_metrics_csv_output, index=False)
 
@@ -299,7 +316,7 @@ def create_master_metrics_csv(prev_metrics_csv, fim_version):
 
 
 # *********************************************************
-def run_test_cases(prev_metrics_csv, fim_version):
+def run_test_cases(fim_version): #prev_metrics_csv, 
     """
     This function
     """
@@ -321,39 +338,41 @@ def run_test_cases(prev_metrics_csv, fim_version):
         version=fim_version,
         archive=archive_results,
         benchmark_categories=[] if benchmark_category == "all" else [benchmark_category],
-    )
-
-    # Check whether a previous metrics CSV has been provided and, if so, make sure the CSV exists
-    if prev_metrics_csv is not None:
-        if not os.path.exists(prev_metrics_csv):
-            print(f"Error: File does not exist at {prev_metrics_csv}")
-            sys.exit(1)
-        else:
-            print(f"Metrics will be combined with previous metric CSV: {prev_metrics_csv}")
-            print()
-    else:
-        print("ALERT: A previous metric CSV has not been provided (-pcsv) - this is optional.")
-        print()
-
+    )    
     model = "GMS"
-    for test_case_class in all_test_cases:
-        if not os.path.exists(test_case_class.fim_dir):
-            continue
-        
-        overwrite=True,
-        verbose=False,
-        alpha_test_args = {
-            'calibrated': False,
-            'model': model,
-            'mask_type': 'huc',
-            'overwrite': overwrite,
-            'verbose': verbose,
-            'gms_workers': 1,
-        }
+    job_number_huc = 1
+    overwrite=True
+    verbose=False
+    calibrated = False
+    job_number_branch = 6
+    # Set up multiprocessor
+    with ProcessPoolExecutor(max_workers=job_number_huc) as executor:
+        # Loop through all test cases, build the alpha test arguments, and submit them to the process pool
+        executor_dict = {}
+        for test_case_class in all_test_cases:
+            # if not os.path.exists(test_case_class.fim_dir):
+            #     continue
+            alpha_test_args = {
+                'calibrated': calibrated,
+                'model': model,
+                'mask_type': 'huc',
+                'overwrite': overwrite,
+                'verbose': verbose,
+                'gms_workers': job_number_branch,
+            }
+            try:
+                future = executor.submit(test_case_class.alpha_test, **alpha_test_args)
+                executor_dict[future] = test_case_class.test_id
+            except Exception as ex:
+                print(f"*** {ex}")
+                traceback.print_exc()
+                sys.exit(1)
 
-        test_case_class.alpha_test(**alpha_test_args)
-
-        metrics_df = create_master_metrics_csv(prev_metrics_csv, fim_version)
+        # # Send the executor to the progress bar and wait for all MS tasks to finish
+        # progress_bar_handler(
+        #     executor_dict, True, f"Running {model} alpha test cases with {job_number_huc} workers"
+        # )
+    metrics_df = create_master_metrics_csv(fim_version)
 
     print("================================")
     print("End synthesize test cases")
@@ -556,50 +575,47 @@ def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df):
                 )
             log_text += 'Completed: Hydro-table updated with new mannN and Q for ' + str(huc)
 
-    return log_text
+    # return log_text
 
 
 # *********************************************************
-def objective_function(mannN_values, *obj_func_args): #, fim_dir, huc, pfim_csv, ## projectDir, synth_test_path, 
+def objective_function(mannN_values, fim_dir, huc): #, fim_dir, huc, ## projectDir, synth_test_path, pfim_csv,
     # This function update hydrotable with mannN and Q,
     # Run alpha test, and defines the objective function
 
     # Create a dataframe, update mannN columns with the new mannN values and ddd feature_ids, 
+    print(f'Updating mannN_values for HUC: {huc}\n')
     mannN_fid_df = initialize_mannN_ai(fim_dir, huc, mannN_file_aibased)
     mannN_fid_df['channel_n_optz'] = mannN_values
     mannN_fid_df['overbank_n_optz'] = mannN_values
 
-    log_text = update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df)
+    print(f'Updating hydro-tables for each branch for HUC: {huc}\n')
+    update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df)
 
     print(f'Running Alphat Test for HUC: {huc}\n')
-    log_text += f'Running Alphat Test for HUC: {huc}\n'
+    # log_text += f'Running Alphat Test for HUC: {huc}\n'
 
     # Call synthesize_test_cases script and run them
     # toolDir = os.path.join(projectDir, "tools")
-    mannN_optz = os.path.basename(os.path.dirname(fim_dir))
+    fim_version = os.path.basename(os.path.dirname(fim_dir))
 
-    # os.system(f"python3 {toolDir}/synthesize_test_cases.py -c DEV -e GMS -v {mannN_optz} -jh 2 -jb 3 -m {synth_test_path} -o -pcsv {pfim_csv}")
-
-    # # Load alpha test metrics (synth_test_cvs)
-    # synth_test_df = pd.read_csv(synth_test_path)
-
-    synth_test_df = create_master_metrics_csv(pfim_csv, mannN_optz)
+    synth_test_df = run_test_cases(fim_version) # pfim_csv, 
     # Read BLE test cases if HUC8 has them **************************************************************************************************
     # 100-year flood 
-    false_neg_100 = synth_test_df["FN_perc"][0] # min
-    false_pos_100 = synth_test_df["FP_perc"][0] # min
+    false_neg_100 = synth_test_df["FN_perc"][1] # min
+    false_pos_100 = synth_test_df["FP_perc"][1] # min
 
-    # 500-year flood
-    false_neg_500 = synth_test_df["FN_perc"][1] # min
-    false_pos_500 = synth_test_df["FP_perc"][1] # min
+    # # 500-year flood
+    # false_neg_500 = synth_test_df["FN_perc"][2] # min
+    # false_pos_500 = synth_test_df["FP_perc"][2] # min
 
     # Calculate metrics (error) for objective function
-    error_mannN = false_neg_100 + false_pos_100 + false_neg_500 + false_pos_500
+    error_mannN = false_neg_100 + false_pos_100 #+ false_neg_500 + false_pos_500
 
-    log_text += 'Completed: ' + str(huc)
-    print("first run completed")
+    # log_text += 'Completed: ' + str(huc)
+    print(error_mannN, mannN_fid_df['channel_n_optz'][0:20])
 
-    return error_mannN #, log_text
+    return error_mannN
 
 
 # *********************************************************
@@ -623,7 +639,7 @@ def alpha_test_metrics_analysis(synth_test_path):
     alpha_metrics = [true_neg_100, false_neg_100, true_pos_100, false_pos_100,
                      true_neg_500, false_neg_500, true_pos_500, false_pos_500]
 
-    return alpha_metrics #, log_text
+    return alpha_metrics
 
 
 # *********************************************************
@@ -653,45 +669,12 @@ if __name__ == '__main__':
         required=True,
         type=str,
     )
-    parser.add_argument(
-        '-pcsv',
-        '--pfim_csv',
-        help="Path to a csv file containing alpha metrics for previous fim",
-        required=True,
-        type=bool,
-    )
-    # parser.add_argument(
-    #     '-synth_path',
-    #     '--synth_test_path',
-    #     help="Path to a csv file to save alpha test metrics",
-    #     required=True,
-    #     type=str,
-    # )
-    # parser.add_argument(
-    #     '-projDir',
-    #     '--projectDir',
-    #     help="Path to the project directory (dev)",
-    #     required=True,
-    #     type=str,
-    # )
-    # parser.add_argument(
-    #     '-j',
-    #     '--number-of-jobs',
-    #     help='OPTIONAL: number of workers (default=8)',
-    #     required=False,
-    #     default=8,
-    #     type=int,
-    # )
 
     args = vars(parser.parse_args())
 
     fim_dir = args['fim_dir']
     huc = args['huc']
     mannN_file_aibased = args['mannN_file_aibased']
-    pfim_csv = args['pfim_csv']
-    # synth_test_path = args['synth_test_path']
-    # projectDir = args['projectDir']
-    # number_of_jobs = args['number_of_jobs']
     
     # *********************************************************
     # huc = "11010004"
@@ -704,7 +687,7 @@ if __name__ == '__main__':
     bounds = [(0.01, 0.5) for _ in range(len(mannN_init))]
 
     # Define rest of arguments for objective_function
-    obj_func_args = (fim_dir, huc, pfim_csv) #projectDir, synth_test_path, 
+    obj_func_args = (fim_dir, huc)
 
     # Define the constraints
     # alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
@@ -732,12 +715,8 @@ if __name__ == '__main__':
     #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0] - alpha_test_metrics_analysis(synth_test_path)[1] - alpha_test_metrics_analysis(synth_test_path)[2] - alpha_test_metrics_analysis(synth_test_path)[3]},
     #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[4] - alpha_test_metrics_analysis(synth_test_path)[5] - alpha_test_metrics_analysis(synth_test_path)[6] - alpha_test_metrics_analysis(synth_test_path)[7]},
     # )
-
+    
     # Run the optimization using the SLSQP algorithm
     res = minimize(objective_function, mannN_init, method="SLSQP", bounds=bounds, args=obj_func_args) #, constraints=constraints
 
-    alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
-
-    print(alpha_metrics)
-    
     print(res.x, res.fun)
