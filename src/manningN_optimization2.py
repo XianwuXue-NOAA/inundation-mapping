@@ -27,9 +27,9 @@ from tools_shared_variables import (
     TEST_CASES_DIR,
 )
 
-fim_dir = "/home/rdp-user/outputs/mno_11010004_cal_off_0710/" 
-huc = "11010004" 
-mannN_file_aibased = "/efs-drives/fim-dev-efs/fim-data/inputs/rating_curve/variable_roughness/ml_outputs_v1.01.parquet"
+# fim_dir = "/home/rdp-user/outputs/mno_11010004_cal_off_0710/" 
+# huc = "11010004" 
+# mannN_file_aibased = "/efs-drives/fim-dev-efs/fim-data/inputs/rating_curve/variable_roughness/ml_outputs_v1.01.parquet"
 
 # *********************************************************
 def create_master_metrics_csv(fim_version): #prev_metrics_csv, 
@@ -290,9 +290,28 @@ def create_master_metrics_csv(fim_version): #prev_metrics_csv,
                 except ValueError:
                     pass
 
+    # # If previous metrics are provided: read in previously compiled metrics and join to calcaulated metrics
+    # if prev_metrics_csv is not None:
+    #     prev_metrics_df = pd.read_csv(prev_metrics_csv)
+
+    #     # Put calculated metrics into a dataframe and set the headers
+    #     df_to_write_calc = pd.DataFrame(list_to_write)
+    #     df_to_write_calc.columns = df_to_write_calc.iloc[0]
+    #     df_to_write_calc = df_to_write_calc[1:]
+
+    #     # Join the calculated metrics and the previous metrics dataframe
+    #     df_to_write = pd.concat([df_to_write_calc, prev_metrics_df], axis=0)
+
+    # else:
+    #     df_to_write = pd.DataFrame(list_to_write)
+    #     df_to_write.columns = df_to_write.iloc[0]
+    #     df_to_write = df_to_write[1:]
+
     df_to_write = pd.DataFrame(list_to_write)
     df_to_write.columns = df_to_write.iloc[0]
     df_to_write = df_to_write[1:]
+    # Save aggregated compiled metrics ('df_to_write') as a CSV
+    # df_to_write.to_csv(master_metrics_csv_output, index=False)
 
     return df_to_write
 
@@ -372,7 +391,7 @@ def run_test_cases(fim_version): #prev_metrics_csv,
 
 
 # *********************************************************
-def initialize_mannN_ai(fim_dir, huc, mannN_file_aibased):
+def initialize_mannN_ai (fim_dir, huc, mannN_file_aibased):
 
     log_text = f'Initializing manningN for HUC: {huc}\n'
     
@@ -419,89 +438,173 @@ def initialize_mannN_ai(fim_dir, huc, mannN_file_aibased):
     
 
 # *********************************************************
-def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df): #, mannN_values
+def update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df):
+
+    log_text = f'Updating hydro_table with new set of manningN for HUC: {huc}\n'
 
     fim_huc_dir = join(fim_dir, huc)
-    # Get hydro_table from each branch
-    ht_all_branches_path = []
+
+    # Get src_full from each branch
+    src_all_branches_path = []
     branches = os.listdir(join(fim_huc_dir, 'branches'))
     for branch in branches:
-        ht_full = join(fim_huc_dir, 'branches', str(branch), f'hydroTable_{branch}.csv')
-        if os.path.isfile(ht_full):
-            ht_all_branches_path.append(ht_full)
+        src_full = join(fim_huc_dir, 'branches', str(branch), f'src_full_crosswalked_{branch}.csv')
+        if os.path.isfile(src_full):
+            src_all_branches_path.append(src_full)
 
-    # Update hydro_table with updated Q and n
-    for ht_path in ht_all_branches_path: #[0:1]
-        # try:
-        ht_name = os.path.basename(ht_path)
-        branch = ht_name.split(".")[0].split("_")[-1]
-        ht_df = pd.read_csv(ht_path, dtype={'feature_id': 'int64'}, low_memory=False) #
+        # Update src with updated Q and n
+        for src_path in src_all_branches_path: #[0:1]
+            try:
+                src_name = os.path.basename(src_path)
+                branch = src_name.split(".")[0].split("_")[-1]
+                log_text += f'  Branch: {branch}\n'
 
-        ## Check the Stage_bankfull exists in the hydro_table (channel ratio column that the user specified) 
-        # drop these cols (in case optz_mann was previously performed)
-        if 'manningN_optz' in ht_df.columns:
-            ht_df = ht_df.drop(
-                ['manningN_optz', 'Discharge(cms)_optzN', 'optzN_on', 'discharge_cms', 'ManningN'],
-                axis=1,
-            )
-        ## Merge (crosswalk) the df of Manning's n with the SRC df
-        ht_df = ht_df.merge(mannN_fid_df, how='left', on='feature_id')
+                log_text += f'Reading the src_full_crosswalked.csv: HUC{str(huc)}, branch id: {str(branch)}\n'
+                src_df = pd.read_csv(src_path, dtype={'feature_id': 'int64'}, low_memory=False) #
 
-        ## Calculate composite Manning's n using the channel geometry ratio attribute given by user
-        ht_df['manningN_optz'] = ht_df['ManningN']
-        ## Define the channel geometry variable names to use from the hydroTable
-        hydr_radius = 'HydraulicRadius (m)'
-        wet_area = 'WetArea (m2)'
+                ## Check the Stage_bankfull exists in the src (channel ratio column that the user specified) 
+                if "Stage_bankfull" not in src_df.columns:
+                    print(
+                        'WARNING --> '
+                        + str(huc)
+                        + '  branch id: '
+                        + str(branch)
+                        + src_path
+                        + ' does not contain the specified channel ratio column: '
+                        + 'Stage_bankfull'
+                    )
+                    print('Skipping --> ' + str(huc) + '  branch id: ' + str(branch))
+                    log_text += (
+                        'WARNING --> '
+                        + str(huc)
+                        + '  branch id: '
+                        + str(branch)
+                        + src_path
+                        + ' does not contain the specified channel ratio column: '
+                        + 'Stage_bankfull'
+                        + '\n'
+                    )
+                else:            
+                    # drop these cols (in case optz_mann was previously performed)
+                    if 'manningN_optz' in src_df.columns:
+                        src_df = src_df.drop(
+                            ['channel_n_optz', 'overbank_n_optz', 'manningN_optz', 'Discharge(cms)_optzN', 'optzN_on'],
+                            axis=1,
+                        )
+                    ## Merge (crosswalk) the df of Manning's n with the SRC df
+                    src_df = src_df.merge(mannN_fid_df, how='left', on='feature_id')
 
-        ## Calculate Q using Manning's equation
-        ht_df['Discharge(cms)_optzN'] = (
-            ht_df[wet_area]
-            * pow(ht_df[hydr_radius], 2.0 / 3)
-            * pow(ht_df['SLOPE'], 0.5)
-            / ht_df['manningN_optz']
-        )
-        optzN_on = True
-        ht_df['optzN_on'] = optzN_on
-        ht_df['discharge_cms'] = ht_df['Discharge(cms)_optzN']
-        ht_df['overbank_n'] = ht_df['manningN_optz']
-        ht_df['channel_n'] = ht_df['manningN_optz']
-        ht_df.to_csv(ht_path, index=False)
+                    ## Calculate composite Manning's n using the channel geometry ratio attribute given by user
+                    src_df['manningN_optz'] = (src_df['Stage_bankfull'] * src_df['channel_n_optz']) + (
+                        (1.0 - src_df['Stage_bankfull']) * src_df['overbank_n_optz']
+                    )
 
-        # except Exception as ex:
-        #     summary = traceback.StackSummary.extract(traceback.walk_stack(None))
-        #     print(
-        #         'WARNING: ' + str(huc) + '  branch id: ' + str(branch) + " updadting hydro_table failed for some reason"
-        #     )
-        #     # log_text += (
-        #     #     'ERROR --> '
-        #     #     + str(huc)
-        #     #     + '  branch id: '
-        #     #     + str(branch)
-        #     #     + " updating hydro_table failed (details: "
-        #     #     + (f"*** {ex}")
-        #     #     + (''.join(summary.format()))
-        #     #     + '\n'
-        #     # )
+                    ## Define the channel geometry variable names to use from the src
+                    hydr_radius = 'HydraulicRadius (m)'
+                    wet_area = 'WetArea (m2)'
+
+                    ## Calculate Q using Manning's equation
+                    src_df['Discharge(cms)_optzN'] = (
+                        src_df[wet_area]
+                        * pow(src_df[hydr_radius], 2.0 / 3)
+                        * pow(src_df['SLOPE'], 0.5)
+                        / src_df['manningN_optz']
+                    )
+
+                    optzN_on = True
+                    src_df['optzN_on'] = optzN_on
+                    # ## Use the default discharge column when optzN is not being applied
+                    # src_df['Discharge(cms)_optzN'] = np.where(
+                    #     src_df['optzN_on'] == False, src_df['Discharge (m3s-1)'], src_df['Discharge(cms)_optzN']
+                    # )  # reset the discharge value back to the original if optzN_on=false
+                    # src_df['manningN_optz'] = np.where(
+                    #     src_df['optzN_on'] == False, src_df['ManningN'], src_df['manningN_optz']
+                    # )  # reset the ManningN value back to the original if optzN_on=false
+
+                    ## Output new SRC with bankfull column
+                    # if output_suffix != "":
+                    #     src_path = os.path.splitext(src_path)[0] + output_suffix + '.csv'
+                    src_df.to_csv(src_path, index=False)
+
+                    ## Output new hydroTable with updated discharge and ManningN column
+                    src_df_trim = src_df[
+                        ['HydroID', 'Stage', 'optzN_on', 'manningN_optz', 'Discharge(cms)_optzN']
+                    ]
+                    src_df_trim = src_df_trim.rename(columns={'Stage': 'stage'})
+                    # create a copy of vmann modified ManningN (used to track future changes)
+                    src_df_trim['ManningN'] = src_df_trim['manningN_optz']
+                    src_df_trim['overbank_n'] = src_df_trim['manningN_optz']
+                    src_df_trim['channel_n'] = src_df_trim['manningN_optz']
+                    # create a copy of vmann modified discharge (used to track future changes)
+                    src_df_trim['discharge_cms'] = src_df_trim['Discharge(cms)_optzN']
+
+                    # Read hydro_table file
+                    htable_name = f'hydroTable_{branch}.csv'
+                    htable_filename = join(fim_huc_dir, 'branches', branch, htable_name)
+                    df_htable = pd.read_csv(htable_filename, dtype={'HUC': str}, low_memory=False)
+
+                    ## drop the previously modified discharge columns to be replaced with updated version
+                    # df_htable.columns
+                    df_htable = df_htable.drop(
+                        columns=['optzN_on', 'discharge_cms', 'ManningN', 'channel_n', 'overbank_n', 'Discharge(cms)_optzN', 'manningN_optz'],
+                        errors='ignore',
+                    #    inplace=True
+                    )
+                    df_htable = df_htable.merge(
+                        src_df_trim, how='left', left_on=['HydroID', 'stage'], right_on=['HydroID', 'stage']
+                    )
+                    # # reset the ManningN value back to the original if vmann=false
+                    # df_htable['optzN_on'] = np.where(
+                    #     df_htable['LakeID'] > 0, False, df_htable['optzN_on']
+                    # )
+
+                    ## Output new hydroTable csv
+                    # if output_suffix != "":
+                    #     htable_filename = os.path.splitext(htable_filename)[0] + output_suffix + '.csv'
+                    df_htable.to_csv(htable_filename, index=False)
+
+            except Exception as ex:
+                summary = traceback.StackSummary.extract(traceback.walk_stack(None))
+                print(
+                    'WARNING: ' + str(huc) + '  branch id: ' + str(branch) + " updadting hydro_table failed for some reason"
+                )
+                log_text += (
+                    'ERROR --> '
+                    + str(huc)
+                    + '  branch id: '
+                    + str(branch)
+                    + " updating hydro_table failed (details: "
+                    + (f"*** {ex}")
+                    + (''.join(summary.format()))
+                    + '\n'
+                )
+            log_text += 'Completed: Hydro-table updated with new mannN and Q for ' + str(huc)
+
+    # return log_text
 
 
 # *********************************************************
-def objective_function(mannN_values, fim_dir, huc, mannN_fid_df):
+def objective_function(mannN_values, fim_dir, huc): #, fim_dir, huc, ## projectDir, synth_test_path, pfim_csv,
     # This function update hydrotable with mannN and Q,
     # Run alpha test, and defines the objective function
-
-    mannN_fid_df['ManningN'] = mannN_values
-    print(mannN_fid_df['ManningN'])
 
     # Create a dataframe, update mannN columns with the new mannN values and ddd feature_ids, 
     print(f'Updating mannN_values for HUC: {huc}\n')
     print(mannN_values[0:20])
+    mannN_fid_df = initialize_mannN_ai(fim_dir, huc, mannN_file_aibased)
+    mannN_fid_df['channel_n_optz'] = mannN_values
+    mannN_fid_df['overbank_n_optz'] = mannN_values
 
     print(f'Updating hydro-tables for each branch for HUC: {huc}\n')
-    update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df) #, mannN_values
+    update_hydrotable_with_mannN_and_Q(fim_dir, huc, mannN_fid_df)
 
     print(f'Running Alphat Test for HUC: {huc}\n')
+    # log_text += f'Running Alphat Test for HUC: {huc}\n'
+
     # Call synthesize_test_cases script and run them
+    # toolDir = os.path.join(projectDir, "tools")
     fim_version = os.path.basename(os.path.dirname(fim_dir))
+
     synth_test_df = run_test_cases(fim_version) # pfim_csv, 
     # Read BLE test cases if HUC8 has them **************************************************************************************************
     # 100-year flood 
@@ -517,6 +620,157 @@ def objective_function(mannN_values, fim_dir, huc, mannN_fid_df):
 
     # log_text += 'Completed: ' + str(huc)
     print(error_mannN, mannN_fid_df['channel_n_optz'][0:20])
+
+    return error_mannN
+
+
+# *********************************************************
+def alpha_test_metrics_analysis(synth_test_path):
+
+    # Load synth_test_cvs
+    synth_test_df = pd.read_csv(synth_test_path)
+    # Read BLE test cases if HUC8 has them **************************************************************************************************
+    # 100-year flood 
+    true_neg_100 = synth_test_df["TN_perc"][0]
+    false_neg_100 = synth_test_df["FN_perc"][0] # min
+    true_pos_100 = synth_test_df["TP_perc"][0]
+    false_pos_100 = synth_test_df["FP_perc"][0] # min
+
+    # 500-year flood
+    true_neg_500 = synth_test_df["TN_perc"][1]
+    false_neg_500 = synth_test_df["FN_perc"][1] # min
+    true_pos_500 = synth_test_df["TP_perc"][1]
+    false_pos_500 = synth_test_df["FP_perc"][1] # min
+
+    alpha_metrics = [true_neg_100, false_neg_100, true_pos_100, false_pos_100,
+                     true_neg_500, false_neg_500, true_pos_500, false_pos_500]
+
+    return alpha_metrics
+
+
+# *********************************************************
+def constraint1(synth_test_path):
+
+    # Load synth_test_cvs
+    synth_test_df = pd.read_csv(synth_test_path)
+
+    # 100-year flood 
+    true_neg_100 = synth_test_df["TN_perc"][0]
+
+    return true_neg_100 - 100
+
+
+def objective_function2(mannN_values, fim_dir, huc, workstation): #, fim_dir, huc, ## projectDir, synth_test_path, pfim_csv,
+    
+    # This function update hydrotable with mannN and Q,
+    # Run alpha test, and defines the objective function
+
+    # Create a dataframe, update mannN columns with the new mannN values and ddd feature_ids, 
+    print(f'Updating mannN_values for HUC: {huc}\n')
+    print(mannN_values[0:20])
+    mannN_fid_df = initialize_mannN_ai(fim_dir, huc, mannN_file_aibased)
+    mannN_fid_df['channel_n_optz'] = mannN_values
+    mannN_fid_df['overbank_n_optz'] = mannN_values
+
+    print(f'Updating hydro-tables for each branch for HUC: {huc}\n')
+    exmp_path = os.path.join(workstation, "hydroTable_1179000101.csv")
+    hydrotable_df = pd.read_csv(exmp_path)
+    mannN_Q_df = hydrotable_df[['HydroID', 'feature_id', 'stage', 'HydraulicRadius (m)', 'WetArea (m2)', 'SLOPE', 
+                                'Discharge(cms)_optzN', 'manningN_optz', 'ManningN', 'overbank_n', 'channel_n', 'discharge_cms']]
+    
+    mannN_Q_df = mannN_Q_df.merge(
+                        mannN_fid_df, how='left', left_on=['feature_id'], right_on=['feature_id'])
+    
+    mannN_Q_df['manningN_optz'] = mannN_Q_df['channel_n_optz']
+    mannN_Q_df['ManningN'] = mannN_Q_df['channel_n_optz']
+    mannN_Q_df['overbank_n'] = mannN_Q_df['channel_n_optz']
+    mannN_Q_df['channel_n'] = mannN_Q_df['channel_n_optz']   
+
+    ## Calculate Q using Manning's equation
+    hydr_radius = 'HydraulicRadius (m)'
+    wet_area = 'WetArea (m2)'
+    mannN_Q_df['Discharge(cms)_optzN'] = (
+        mannN_Q_df[wet_area]
+        * pow(mannN_Q_df[hydr_radius], 2.0 / 3)
+        * pow(mannN_Q_df['SLOPE'], 0.5)
+        / mannN_Q_df['manningN_optz']
+    )
+    mannN_Q_df['discharge_cms'] = mannN_Q_df['Discharge(cms)_optzN']
+
+    mannN_Q_df = mannN_Q_df.drop(columns=['channel_n_optz', 'overbank_n_optz', 'HydraulicRadius (m)', 'WetArea (m2)', 'SLOPE', ], errors='ignore')
+
+    hydrotable_df = hydrotable_df.drop(
+        columns=['discharge_cms', 'ManningN', 'channel_n', 'overbank_n', 'Discharge(cms)_optzN', 'manningN_optz'],
+        errors='ignore')
+    
+    hydrotable_df = hydrotable_df.merge(
+        mannN_Q_df, how='left', left_on=['HydroID', 'stage', 'feature_id'], right_on=['HydroID', 'stage', 'feature_id']
+    )
+    hydrotable_df.to_csv(exmp_path, index=False)    
+
+    print(f'Running Alphat Test for HUC: {huc}\n')
+    # log_text += f'Running Alphat Test for HUC: {huc}\n'
+
+    # Call synthesize_test_cases script and run them
+    # toolDir = os.path.join(projectDir, "tools")
+    # fim_version = os.path.basename(os.path.dirname(fim_dir))
+    exmp_path_error = os.path.join(workstation, "Q_error.csv")
+    # synth_test_df = run_test_cases(fim_version) # pfim_csv,
+    obj_Q_df = pd.read_csv(exmp_path_error)['default_discharge_cms']
+
+    # # Read BLE test cases if HUC8 has them **************************************************************************************************
+    # # 100-year flood 
+    # false_neg_100 = synth_test_df["FN_perc"][1] # min
+    # false_pos_100 = synth_test_df["FP_perc"][1] # min
+
+    # # # 500-year flood
+    # # false_neg_500 = synth_test_df["FN_perc"][2] # min
+    # # false_pos_500 = synth_test_df["FP_perc"][2] # min
+
+    # # Calculate metrics (error) for objective function
+    # error_mannN = false_neg_100 + false_pos_100 #+ false_neg_500 + false_pos_500
+
+    error_mannN = (((np.sum(obj_Q_df-hydrotable_df['discharge_cms']))**2)/len(obj_Q_df))**(1./2)
+
+    # log_text += 'Completed: ' + str(huc)
+    print(error_mannN, mannN_fid_df['channel_n_optz'][0:20])
+
+
+    return error_mannN
+
+
+def objective_function3(mannN_values, huc, obj_Q_df, mannN_Q_df): #, fim_dir, huc, ## projectDir, synth_test_path, pfim_csv,
+    
+    # This function update hydrotable with mannN and Q,
+    # Run alpha test, and defines the objective function
+
+    # Create a dataframe, update mannN columns with the new mannN values and ddd feature_ids, 
+    print(f'Updating mannN_values for HUC: {huc}\n')
+
+    mannN_Q_df['ManningN'] = mannN_values
+
+    print(f'Updating hydro-tables for each branch for HUC: {huc}\n')
+    
+    mannN_Q_df['manningN_optz'] = mannN_Q_df['ManningN']
+    
+    ## Calculate Q using Manning's equation
+    hydr_radius = 'HydraulicRadius (m)'
+    wet_area = 'WetArea (m2)'
+    mannN_Q_df['Discharge(cms)_optzN'] = (
+        mannN_Q_df[wet_area]
+        * pow(mannN_Q_df[hydr_radius], 2.0 / 3)
+        * pow(mannN_Q_df['SLOPE'], 0.5)
+        / mannN_Q_df['manningN_optz']
+    )
+    mannN_Q_df['discharge_cms'] = mannN_Q_df['Discharge(cms)_optzN']
+
+    print(f'Running Alphat Test for HUC: {huc}\n')
+
+    error_mannN = (((np.sum(obj_Q_df-mannN_Q_df['discharge_cms']))**2)/len(obj_Q_df))**(1./2)
+
+    # log_text += 'Completed: ' + str(huc)
+    print(error_mannN, mannN_values[0:20])
+
 
     return error_mannN
 
@@ -549,18 +803,34 @@ if __name__ == '__main__':
 
     print(f'Updating hydro-tables for each branch for HUC: {huc}\n')
 
+    workstation = "/fim-home/heidi.safa/roughness_optimization/optz_example/"
+    exmp_path = os.path.join(workstation, "hydroTable_1179000101.csv")
+    hydrotable_df_initial = pd.read_csv(exmp_path)
+
+    exmp_path_error = os.path.join(workstation, "Q_error.csv")
+    # synth_test_df = run_test_cases(fim_version) # pfim_csv,
+    obj_Q_df = pd.read_csv(exmp_path_error)['default_discharge_cms']
+    
+    mannN_Q_df = hydrotable_df_initial[['HydroID', 'feature_id', 'stage', 'HydraulicRadius (m)', 'WetArea (m2)', 'SLOPE', 
+                                'Discharge(cms)_optzN', 'manningN_optz', 'discharge_cms']]
+    
+    mannN_Q_df = mannN_Q_df.merge(initial_mannN_ai_df, how='left', left_on=['feature_id'], right_on=['feature_id'])
+    
     # Define the initial values for mannN
-    mannN_init = initial_mannN_ai_df['ManningN'].values
-    mannN_fid_df = initial_mannN_ai_df.copy()
+    mannN_init = mannN_Q_df['ManningN'].values
+
 
     # Define the bounds for mannN (assuming it's a bounded optimization problem)
     bounds = [(0.01, 0.5) for _ in range(len(mannN_init))]
 
     # Define rest of arguments for objective_function
-    obj_func_args = (fim_dir, huc, mannN_fid_df)
+    obj_func_args = (huc, hydrotable_df_initial, obj_Q_df, mannN_Q_df)
 
     # Define the constraints
     # alpha_metrics = alpha_test_metrics_analysis(synth_test_path)
+
+    # print(alpha_metrics)
+
     # constraints = (
     #     {'type': 'ineq', 'fun': lambda synth_test_path: alpha_test_metrics_analysis(synth_test_path)[0] - 0},  # a > 0
     #     # {'type': 'ineq', 'fun': lambda synth_test_path: 100 - alpha_test_metrics_analysis(synth_test_path)[0]},  # a < 100
@@ -584,6 +854,6 @@ if __name__ == '__main__':
     # )
     print(mannN_init[0:20])
     # Run the optimization using the SLSQP algorithm
-    res = minimize(objective_function, mannN_init, method="SLSQP", bounds=bounds, args=obj_func_args) #, constraints=constraints
+    res = minimize(objective_function3, mannN_init, method="SLSQP", bounds=bounds, args=obj_func_args) #, constraints=constraints
 
     print(res.x, res.fun)
